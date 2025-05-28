@@ -1,9 +1,12 @@
+-- Assign a numeric rank to each data source to determine precedence
 WITH DataSourceRanking AS (
     SELECT 'Google' AS dataSource, 1 AS rank_order UNION ALL
     SELECT 'Microsoft', 2 UNION ALL
     SELECT 'Amazon', 3 UNION ALL
     SELECT 'IBM', 4
 ),
+
+-- Simulated source data with various row values, start/end timestamps, and change history
 your_table AS (
     SELECT * FROM VALUES
     ('id1', 'price', 'Amazon',     'value1', '2022-01-01 01:01:00'::timestamp_ntz, NULL,               '2022-01-01 01:01:00'::timestamp_ntz),
@@ -16,6 +19,8 @@ your_table AS (
     ('id2', 'qty',   'IBM',       '10',     '2021-01-30 01:05:00'::timestamp_ntz, NULL,               '2021-01-30 01:05:00'::timestamp_ntz)
     AS T(rowId, rowType, dataSource, rowValue, startTimestamp, endTimestamp, changeTimestamp)
 ),
+
+-- Deduplicate source rows to keep the authoritative record per data source and time
 AuthoritativeOriginalRecords AS (
     SELECT *,
            ROW_NUMBER() OVER (
@@ -26,21 +31,29 @@ AuthoritativeOriginalRecords AS (
            ) AS rn
     FROM your_table
 ),
+
+-- Keep only the top authoritative source record per partition
 FilteredOriginalRecords AS (
     SELECT rowId, rowType, dataSource, rowValue, startTimestamp, endTimestamp, changeTimestamp
     FROM AuthoritativeOriginalRecords
     WHERE rn = 1
 ),
+
+-- All unique time points where row status could change (start or end of a segment)
 AllTimePoints AS (
     SELECT DISTINCT startTimestamp AS time_point FROM FilteredOriginalRecords
     UNION
     SELECT DISTINCT endTimestamp AS time_point FROM FilteredOriginalRecords WHERE endTimestamp IS NOT NULL
 ),
+
+-- Add source ranking to authoritative source records for precedence comparison
 RankedOriginalRows AS (
     SELECT fr.*, dsr.rank_order AS dataSourceRank
     FROM FilteredOriginalRecords fr
     JOIN DataSourceRanking dsr ON fr.dataSource = dsr.dataSource
 ),
+
+-- Determine which source rows are active at each time point
 ActiveRowsAtTimePoint AS (
     SELECT
         atp.time_point,
@@ -50,6 +63,8 @@ ActiveRowsAtTimePoint AS (
       ON atp.time_point >= ror.startTimestamp
      AND (ror.endTimestamp IS NULL OR atp.time_point < ror.endTimestamp)
 ),
+
+-- Pick the winning row at each time point based on dataSource rank and recency
 WinningRowCandidates AS (
     SELECT *,
            ROW_NUMBER() OVER (
@@ -58,18 +73,23 @@ WinningRowCandidates AS (
            ) AS rn
     FROM ActiveRowsAtTimePoint
 ),
+
+-- Final winner rows at each time point including the original provider's change info
 CurrentWinners AS (
     SELECT
         time_point,
         rowId,
         rowType,
-        dataSource,
+        dataSource AS originalProvider,
         rowValue,
+        changeTimestamp,
         startTimestamp AS source_start,
         endTimestamp AS source_end
     FROM WinningRowCandidates
     WHERE rn = 1
 ),
+
+-- Capture transitions between winners over time and compare values to detect changes
 WinnerWithTransitions AS (
     SELECT
         *,
@@ -78,12 +98,16 @@ WinnerWithTransitions AS (
         LEAD(rowValue) OVER (PARTITION BY rowId, rowType ORDER BY time_point) AS next_rowValue
     FROM CurrentWinners
 ),
+
+-- Generate winner segments with precise microsecond-end logic on value change or source end
 FinalWinnerRows AS (
     SELECT
         rowId,
         rowType,
         'Winner' AS dataSource,
         rowValue,
+        originalProvider,
+        changeTimestamp,
         time_point AS segment_startTimestamp,
         CASE
             WHEN next_time IS NOT NULL AND 
@@ -91,12 +115,14 @@ FinalWinnerRows AS (
                      rowValue IS DISTINCT FROM next_rowValue OR 
                      (source_end IS NOT NULL AND next_time >= source_end)
                  )
-            THEN next_time
+            THEN DATEADD(microsecond, -1, next_time)
             ELSE NULL
         END AS segment_endTimestamp
     FROM WinnerWithTransitions
     WHERE rowValue IS DISTINCT FROM prev_rowValue OR prev_rowValue IS NULL
 ),
+
+-- Deduplicate in case of edge-case overlaps or noise
 DeduplicatedWinners AS (
     SELECT *,
            ROW_NUMBER() OVER (
@@ -107,7 +133,7 @@ DeduplicatedWinners AS (
     WHERE rowValue IS NOT NULL
 )
 
--- Final output
+-- Final output: union of computed winner records and original source records
 SELECT
     rowId,
     rowType,
@@ -115,6 +141,8 @@ SELECT
     rowValue,
     segment_startTimestamp AS startTimestamp,
     segment_endTimestamp AS endTimestamp,
+    originalProvider,
+    changeTimestamp,
     'winning_value' AS record_type
 FROM DeduplicatedWinners
 WHERE rn = 1
@@ -128,6 +156,8 @@ SELECT
     rowValue,
     startTimestamp,
     endTimestamp,
+    'VENDOR' AS originalProvider,
+    changeTimestamp,
     'source' AS record_type
 FROM your_table
 
