@@ -1,0 +1,254 @@
+# The Snowpark package is required for Python Worksheets.
+# You can add more packages by selecting them using the Packages control and then importing them.
+
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import col, lit, when, lead, lag, dateadd, row_number, coalesce, greatest, last_value
+from snowflake.snowpark.functions import sum as s_sum
+from snowflake.snowpark.functions import max as s_max
+from snowflake.snowpark.functions import min as s_min
+from snowflake.snowpark.window import Window
+import datetime
+from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, TimestampType, BooleanType, DecimalType, DateType
+
+def main(session: snowpark.Session):
+    """
+    This function demonstrates a full bi-temporal merge process in Snowpark.
+    It creates a history and delta dataframe, then applies the delta's changes
+    (corrections, new versions, new assets) to the history dataframe using a
+    robust "rebuild from event kernel" approach.
+    """
+
+    # --- 1. Define Schemas ---
+    history_schema = StructType([
+        StructField("ASSET_ID", IntegerType(), nullable=False),
+        StructField("DATA_PROVIDER", StringType(), nullable=False),
+        StructField("DATA_PROVIDER_TYPE", StringType(), nullable=True),
+        StructField("START_TMS", TimestampType(), nullable=False),
+        StructField("END_TMS", TimestampType(), nullable=True),
+        StructField("LAST_CHG_TMS", TimestampType(), nullable=False),
+        StructField("IS_CURRENT", BooleanType(), nullable=False),
+        StructField("ASSET_COUNTRY", StringType(), nullable=True),
+        StructField("ASSET_CURRENCY", StringType(), nullable=True),
+        StructField("ASSET_PRICE", DecimalType(18, 4), nullable=True),
+        StructField("ASSET_MATURITY_TMS", TimestampType(), nullable=True),
+        StructField("TXN_START_TMS", TimestampType(), nullable=True),
+        StructField("TXN_END_TMS", TimestampType(), nullable=True),
+        StructField("IS_LATEST_TXN", BooleanType(), nullable=True)
+    ])
+
+    delta_schema = StructType([
+        StructField("ASSET_ID", IntegerType(), nullable=False),
+        StructField("DATA_PROVIDER", StringType(), nullable=False),
+        StructField("DATA_PROVIDER_TYPE", StringType(), nullable=True),
+        StructField("START_TMS", TimestampType(), nullable=False),
+        StructField("LAST_CHG_TMS", TimestampType(), nullable=False),
+        StructField("ASSET_COUNTRY", StringType(), nullable=True),
+        StructField("ASSET_CURRENCY", StringType(), nullable=True),
+        StructField("ASSET_PRICE", DecimalType(18, 4), nullable=True),
+        StructField("ASSET_MATURITY_TMS", TimestampType(), nullable=True)
+    ])
+
+    # --- 2. Define and Create Sample DataFrames ---
+    history_data = [
+        # Asset 1
+        (1, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 1, 1), datetime.datetime(2023, 2, 1, 23, 59, 59), datetime.datetime(2023, 1, 1), False, 'USA', 'USD', 100.50, datetime.datetime(2030, 1, 1),
+         datetime.datetime(2023, 1, 1), None, True),
+        (1, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 2, 2), datetime.datetime(2024, 1, 11, 23, 59, 59), datetime.datetime(2024, 1, 12, 10, 1, 1), False, 'USA', 'USD', 100.50, datetime.datetime(2031, 5, 1),
+         datetime.datetime(2024, 1, 12, 10, 1, 1), None, True),
+        (1, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2024, 1, 12), None, datetime.datetime(2024, 1, 12, 10, 1, 5), True, 'USA', 'USD', 103.00, datetime.datetime(2025, 12, 1),
+         datetime.datetime(2024, 1, 12, 10, 1, 5), None, True),
+
+        # Asset 2
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2023, 5, 10), datetime.datetime(2023, 8, 31, 23, 59, 59), datetime.datetime(2023, 5, 10), False, 'CAN', 'CAD', 1500.00, datetime.datetime(2028, 6, 15),
+         datetime.datetime(2023, 5, 10), None, True),
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2023, 9, 1), datetime.datetime(2024, 6, 30, 23, 59, 59), datetime.datetime(2023, 9, 1), False, 'CAN', 'CAD', 1512.25, datetime.datetime(2028, 6, 15),
+         datetime.datetime(2023, 9, 1), None, True),
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2024, 7, 1), None, datetime.datetime(2024, 7, 1), True, 'CAN', 'CAD', 1515.00, datetime.datetime(2028, 6, 15),
+         datetime.datetime(2024, 7, 1), None, True),
+
+        # Asset 3
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2022, 1, 1), datetime.datetime(2022, 12, 31, 23, 59, 59), datetime.datetime(2022, 1, 1), False, 'GBR', 'GBP', 85.20, datetime.datetime(2025, 1, 1),
+         datetime.datetime(2022, 1, 1), None, True),
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 1, 1), datetime.datetime(2023, 6, 30, 23, 59, 59), datetime.datetime(2023, 1, 1), False, 'GBR', 'GBP', 90.00, datetime.datetime(2025, 1, 1),
+         datetime.datetime(2023, 1, 1), None, True),
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 7, 1), None, datetime.datetime(2023, 7, 1), True, 'GBR', 'GBP', 92.50, datetime.datetime(2025, 1, 1),
+         datetime.datetime(2023, 7, 1), None, True),
+    ]
+
+    delta_data = [
+        # Asset 1
+        (1, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 1, 1), datetime.datetime(2023, 1, 15), None, None, 101.00, None),
+        (1, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2024, 1, 12), datetime.datetime(2024, 1, 20), None, None, None, datetime.datetime(1, 1, 1)),
+
+        # Asset 2
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2023, 5, 10), datetime.datetime(2023, 6, 1), None, None, None, datetime.datetime(2028, 6, 16)),
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2023, 9, 1), datetime.datetime(2023, 9, 15), None, '$$DELETED$$', None, None),
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2024, 7, 1), datetime.datetime(2024, 7, 10), '$$DELETED$$', None, None, None),
+        (2, 'BLOOMBERG', 'VENDOR', datetime.datetime(2025, 1, 1), datetime.datetime(2024, 12, 15), None, None, 1525.00, None),
+
+        # Asset 3
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2022, 1, 1), datetime.datetime(2022, 2, 1), 'GBR', None, None, None),
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2023, 7, 1), datetime.datetime(2023, 7, 2), None, None, 1234567890.12345, None),
+        (3, 'ENTERPRISE', 'INTERNAL', datetime.datetime(2026, 3, 1), datetime.datetime(2025, 12, 1), None, 'GBP', None, None),
+
+        # Asset 4
+        (4, 'EXTEL', 'VENDOR', datetime.datetime(2023, 7, 20), datetime.datetime(2023, 7, 20), 'JPN', 'JPY', 25000.00, datetime.datetime(2035, 1, 1)),
+    ]
+
+    df_history = session.create_dataframe(history_data, schema=history_schema)
+    df_delta = session.create_dataframe(delta_data, schema=delta_schema)
+
+    # --- 3. Stage 1: Create a Kernel of Explicit Changes ---
+    key_cols = ["ASSET_ID", "DATA_PROVIDER"]
+    data_cols = ["DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    all_cols = key_cols + ["START_TMS", "LAST_CHG_TMS"] + data_cols
+
+    # Get the first known state of each asset from history
+    first_hist_window = Window.partitionBy(*key_cols).orderBy("START_TMS", "LAST_CHG_TMS")
+    df_first_hist = df_history.with_column("rn", row_number().over(first_hist_window)).filter(col("rn") == 1).select(*all_cols)
+
+    # The kernel is the first historical state plus all sparse deltas
+    df_kernel = df_first_hist.union_by_name(df_delta.select(*all_cols))
+
+    # --- 4. Stage 2: Create a Dense Timeline and Propagate (LOCF) ---
+    # Get all timestamps where an event happened for each asset
+    all_start_tms = df_history.select(*key_cols, "START_TMS").union_by_name(df_delta.select(*key_cols, "START_TMS")).distinct()
+
+    # Join the dense timeline with the kernel of changes
+    df_dense = all_start_tms.join(df_kernel, key_cols + ["START_TMS"], "left")
+
+    # Use LOCF (Last Observation Carried Forward) to propagate values
+    locf_window = Window.partitionBy(*key_cols).orderBy("START_TMS").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    
+    df_propagated = df_dense
+    for data_col in data_cols + ["LAST_CHG_TMS"]:
+        df_propagated = df_propagated.with_column(
+            data_col,
+            last_value(col(data_col), ignore_nulls=True).over(locf_window)
+        )
+
+    # --- 5. Stage 3: Reconstruct Transaction History ---
+    # Combine the propagated, latest states with the original sparse changes to rebuild the transaction history
+    df_latest_txns = df_propagated.with_column("IS_LATEST_TXN", lit(True))
+    
+    # Identify transactions that are not the latest for their START_TMS
+    # These are kernel events that were superseded by a later delta at the same START_TMS
+    superseded_window = Window.partitionBy(*key_cols, "START_TMS").orderBy(col("LAST_CHG_TMS").desc())
+    df_kernel_with_rank = df_kernel.with_column("rn", row_number().over(superseded_window))
+    
+    df_old_txns = (
+        df_kernel_with_rank.alias("k")
+        .join(
+            df_latest_txns.alias("l"),
+            key_cols + ["START_TMS"],
+            "inner"
+        )
+        .where(col("k.rn") > 1)
+        .select(
+            col("l.ASSET_ID"), col("l.DATA_PROVIDER"), col("l.START_TMS"),
+            col("k.LAST_CHG_TMS"),
+            # For old transactions, we need to LOCF values up to their own point in time
+            # We must re-run a limited LOCF on the kernel data
+        )
+    )
+    
+    # This part is tricky: we need to correctly fill the data for old transactions
+    # We will union all transaction-creating events (latest and old) and then re-propagate
+    
+    all_txn_points = df_latest_txns.select(*all_cols).union_by_name(df_kernel.filter(col("LAST_CHG_TMS").isNotNull()).select(*all_cols)).distinct()
+
+    # Re-propagate on the full set of transaction points
+    locf_txn_window = Window.partitionBy(*key_cols).orderBy("START_TMS", "LAST_CHG_TMS")
+    
+    final_timeline = all_txn_points
+    for data_col in data_cols:
+        locf_group_window = Window.partitionBy(*key_cols).orderBy("START_TMS", "LAST_CHG_TMS")
+        final_timeline = final_timeline.with_column(
+            f"{data_col}_grp",
+            s_sum(when(col(data_col).is_not_null(), 1).otherwise(0)).over(locf_group_window)
+        )
+        final_timeline = final_timeline.with_column(
+            data_col,
+            s_max(col(data_col)).over(Window.partitionBy(*key_cols, f"{data_col}_grp"))
+        )
+    final_timeline = final_timeline.drop(*[f"{c}_grp" for c in data_cols])
+
+    # Filter out records that are identical to their predecessor (no-change deltas)
+    comparison_cols = data_cols
+    prev_val_window = Window.partitionBy(*key_cols, "START_TMS").orderBy("LAST_CHG_TMS")
+    
+    for c in comparison_cols:
+        final_timeline = final_timeline.with_column(f"prev_{c}", lag(c, 1).over(prev_val_window))
+    
+    change_filter = lit(False)
+    for c in comparison_cols:
+        # Use NULL-safe distinctness check to avoid type errors with coalesce
+        # This is equivalent to "IS DISTINCT FROM"
+        are_not_same = (
+            (col(c) != col(f"prev_{c}")) | 
+            (col(c).isNull() & col(f"prev_{c}").isNotNull()) |
+            (col(c).isNotNull() & col(f"prev_{c}").isNull())
+        )
+        change_filter = change_filter | are_not_same
+    
+    final_timeline = final_timeline.with_column("is_first_txn", row_number().over(prev_val_window) == 1)
+    final_timeline = final_timeline.filter(col("is_first_txn") | change_filter)
+    final_timeline = final_timeline.drop(*[f"prev_{c}" for c in comparison_cols] + ["is_first_txn"])
+    
+
+    # --- 6. Final Bi-temporal Reconstruction ---
+    # Transaction-time within each START_TMS
+    txn_window = Window.partitionBy(*key_cols, "START_TMS").orderBy(col("LAST_CHG_TMS").asc())
+    with_txn = (
+        final_timeline
+        .with_column("TXN_START_TMS", col("LAST_CHG_TMS"))
+        .with_column("next_txn_start", lead("LAST_CHG_TMS").over(txn_window))
+        .with_column(
+            "TXN_END_TMS",
+            when(col("next_txn_start").is_not_null(), dateadd('second', lit(-1), col("next_txn_start")))
+            .otherwise(lit(None).cast(TimestampType()))
+        )
+        .with_column("IS_LATEST_TXN", col("TXN_END_TMS").is_null())
+    )
+
+    # Valid-time across distinct START_TMS values
+    valid_time_window = Window.partitionBy(*key_cols).orderBy(col("START_TMS").asc())
+    distinct_starts = (
+        with_txn
+        .filter(col("IS_LATEST_TXN"))
+        .with_column("next_start_tms", lead("START_TMS").over(valid_time_window))
+        .select(*key_cols, "START_TMS", "next_start_tms")
+    )
+    
+    final_df = (
+        with_txn.join(distinct_starts, key_cols + ["START_TMS"], "left")
+        .with_column(
+            "END_TMS",
+            when(col("next_start_tms").is_not_null(), dateadd('second', lit(-1), col("next_start_tms")))
+            .otherwise(lit(None).cast(TimestampType()))
+        )
+        .with_column("IS_CURRENT", col("END_TMS").is_null())
+        .select(
+            "ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE", "START_TMS", "END_TMS",
+            "LAST_CHG_TMS", "IS_CURRENT", "ASSET_COUNTRY", "ASSET_CURRENCY",
+            "ASSET_PRICE", "ASSET_MATURITY_TMS",
+            "TXN_START_TMS", "TXN_END_TMS", "IS_LATEST_TXN"
+        )
+    )
+    
+    # --- 7. Clean up Deletion Sentinels ---
+    excluded_cols = {"ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS", "IS_CURRENT", "TXN_START_TMS", "TXN_END_TMS", "IS_LATEST_TXN"}
+    
+    for field in final_df.schema.fields:
+        name = field.name
+        if name in excluded_cols:
+            continue
+        dtype = field.datatype
+        if isinstance(dtype, StringType):
+            final_df = final_df.with_column(name, when(col(name) == lit("$$DELETED$$"), lit(None)).otherwise(col(name)))
+        elif isinstance(dtype, DecimalType):
+            final_df = final_df.with_column(name, when(col(name) == lit(1234567890.12345), lit(None).cast(DecimalType(18,4))).otherwise(col(name)))
+        elif isinstance(dtype, (TimestampType, DateType)):
+            final_df = final_df.with_column(name, when(col(name) == lit(datetime.datetime(1, 1, 1)), lit(None)).otherwise(col(name)))
+
+    return final_df.sort("ASSET_ID", "DATA_PROVIDER", "START_TMS", "TXN_START_TMS")
