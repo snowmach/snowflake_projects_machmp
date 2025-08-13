@@ -1,0 +1,15 @@
+This code needs to do the following.
+•	If we receive a delta record, pull all the history table records for that asset_id and data provider.
+•	Find if there are any history records with the same START_TMS for that asset_id and data_provider.
+o	If yes, then end the current matching history record with TXN_END_TMS = LAST_CHG_TMS of the delta record minus 1 microsecond and IS_LATEST_TXN = FALSE. Also, insert a new row for that asset_id, data_provider, start_tms with TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE. Apart from the data columns which have non-null values in the delta record,  for remaining data columns, use the values from the existing history record we just updated with the TXN_END_TMS
+	If there are contiguous future dated rows (based on START_TMS) for the same asset_id and data_provider, and they had the same value as the current row (based on DELTA record START_TMS) that got updated, then the updated value for those columns from the DELTA record should be propagated to those rows too. Instead of updating them directly, we need to use the same logic of updating  TXN_END_TMS = LAST_CHG_TMS of the delta record minus 1 microsecond and IS_LATEST_TXN = FALSE and also inserting a clone of this row with TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE with the updated value in those impacted columns based on the delta record.
+o	If no, 
+	Find if there are any past-dated rows for that asset_id and data_provider. 
+•	If yes, then check if there are any future dated rows for that asset_id and data_provider.
+o	If no, then insert a new record with START_TMS = START_TMS from DELTA record, END_TMS = NULL, TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE. Apart from the data columns which have non-null values in the delta record, for remaining data columns, use the values from the most recent past dated record.
+o	If yes, then
+	update the most recent past dated record with TXN_END_TMS = LAST_CHG_TMS of the delta record minus 1 microsecond. Before updating this row, clone it and insert a new row with END_TMS = LAST_CHG_TMS of the delta record minus 1 microsecond, TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE.
+	Insert a new record with START_TMS = START_TMS from DELTA record, END_TMS = START_TMS of the next immediate record in the history for the same ASSET_ID and DATA_PROVIDER minus 1 microsecond, TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE. Apart from the data columns which have non-null values in the delta record,  for remaining data columns, use the values from the most recent past dated record.
+•	If no, then check if there are any future dated records for that asset_id and data_provider.
+o	If yes, then skip the delta record since we don’t want to insert history records prior to the existing history records
+o	If no (i.e., no past or future dated records for the same asset_id and data_provider), then insert a new record with START_TMS = START_TMS from DELTA record, END_TMS = NULL, TXN_START_TMS = LAST_CHG_TMS of the delta record and IS_LATEST_TXN = TRUE.
