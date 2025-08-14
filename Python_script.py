@@ -1,177 +1,201 @@
 import pandas as pd
 import io
 import datetime
-# The Snowpark package is required for Python Worksheets.
 import snowflake.snowpark as snowpark
-from snowflake.snowpark.functions import col, lit, when, lead, lag, dateadd, row_number, coalesce, last_value
-from snowflake.snowpark.window import Window
-import datetime
-from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, TimestampType, BooleanType, DecimalType, DateType
 
 def main(session: snowpark.Session):
-    """
-    This function performs a bi-temporal merge using Snowflake Snowpark DataFrames.
-    It combines a history DataFrame with a delta DataFrame, propagates changes,
-    and correctly establishes valid-time and transaction-time to create a final,
-    merged bi-temporal history.
-    """
-    # Run the function and print the final DataFrame
     merged_history = bi_temporal_merge_pandas()
+
+    # Print for worksheet debugging
     print("Final Merged Bi-Temporal DataFrame:")
     print(merged_history)
+
+    # Enforce schema-friendly dtypes before sending to Snowflake
+    merged_history["ASSET_PRICE"] = pd.to_numeric(merged_history["ASSET_PRICE"], errors="coerce")
+    merged_history["ASSET_MATURITY_TMS"] = pd.to_datetime(merged_history["ASSET_MATURITY_TMS"], errors="coerce")
+    merged_history["START_TMS"] = pd.to_datetime(merged_history["START_TMS"], errors="coerce")
+    merged_history["END_TMS"] = pd.to_datetime(merged_history["END_TMS"], errors="coerce")
+    merged_history["TXN_START_TMS"] = pd.to_datetime(merged_history["TXN_START_TMS"], errors="coerce")
+    merged_history["TXN_END_TMS"] = pd.to_datetime(merged_history["TXN_END_TMS"], errors="coerce")
+
     df = session.create_dataframe(data=merged_history)
     return df
 
-def bi_temporal_merge_pandas():
-    """
-    This function demonstrates a bi-temporal merge process using the Pandas library.
-    It combines history and delta data, propagates changes, and reconstructs the
-    valid-time and transaction-time axes to produce a complete, merged history.
-    
-    This implementation is a more readable and idiomatic Python alternative to
-    the previous Snowpark version for data manipulation tasks.
-    """
 
-    # --- 1. Define Sample Data as TSV Strings ---
-    # In a real-world scenario, you would load these from files or a database.
-    # The TSV format is used here to mimic the input structure from the user's
-    # uploaded files.
+def bi_temporal_merge_pandas():
+    # --- 1) Sample data (you can replace with real loads) ---
     history_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	TXN_END_TMS	IS_LATEST_TXN	DATA_PROVIDER_TYPE	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
 1	ENTERPRISE	2023-01-01 00:00:00.000	2023-02-01 23:59:59.000	2023-01-01 00:00:00.000	false	2023-01-01 00:00:00.000	2023-01-14 23:59:59.000	false	INTERNAL	USA	USD	100.50000	2030-01-01 00:00:00.000
 1	ENTERPRISE	2023-01-01 00:00:00.000	2023-02-01 23:59:59.000	2023-01-15 00:00:00.000	false	2023-01-15 00:00:00.000	2024-01-11 23:59:59.000	false	INTERNAL	USA	USD	101.00000	2030-01-01 00:00:00.000
-1	ENTERPRISE	2023-02-02 00:00:00.000	2024-01-11 23:59:59.000	2024-01-12 10:01:01.000	false	2024-01-12 10:01:01.000	2024-01-12 10:01:04.000	false	INTERNAL	USA	USD	100.50000	2031-05-01 00:00:00.000
-1	ENTERPRISE	2024-01-12 00:00:00.000		2024-01-12 10:01:05.000	true	2024-01-12 10:01:05.000		true	INTERNAL	USA	USD	103.00000	2025-12-01 00:00:00.000
+1	ENTERPRISE	2023-02-02 00:00:00.000	2024-01-11 23:59:59.000	2024-01-12 10:01:01.000	false	2024-01-12 10:01:01.000	2024-01-12 10:01:04.000	false	INTERNAL	USA	USD	100.50000	2030-01-01 00:00:00.000
+1	ENTERPRISE	2024-01-12 00:00:00.000	NaT	2024-01-12 10:01:05.000	true	2024-01-12 10:01:05.000	NaT	true	INTERNAL	USA	USD	103.00000	2025-12-01 00:00:00.000
 2	BLOOMBERG	2023-05-10 00:00:00.000	2023-08-31 23:59:59.000	2023-05-10 00:00:00.000	false	2023-05-10 00:00:00.000	2023-08-31 23:59:59.000	false	VENDOR	CAN	CAD	1500.00000	2028-06-15 00:00:00.000
 """
 
-    # uploaded files.
-    history_tsv_unused = """
-ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	TXN_END_TMS	IS_LATEST_TXN	DATA_PROVIDER_TYPE	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
-1	ENTERPRISE	2023-01-01 00:00:00.000	2023-02-01 23:59:59.000	2023-01-01 00:00:00.000	false	2023-01-01 00:00:00.000	2023-01-14 23:59:59.000	false	INTERNAL	USA	USD	100.50000	2030-01-01 00:00:00.000
-1	ENTERPRISE	2023-01-01 00:00:00.000	2023-02-01 23:59:59.000	2023-01-15 00:00:00.000	false	2023-01-15 00:00:00.000	2024-01-11 23:59:59.000	false	INTERNAL	USA	USD	101.00000	2030-01-01 00:00:00.000
-1	ENTERPRISE	2023-02-02 00:00:00.000	2024-01-11 23:59:59.000	2024-01-12 10:01:01.000	false	2024-01-12 10:01:01.000	2024-01-12 10:01:04.000	false	INTERNAL	USA	USD	100.50000	2031-05-01 00:00:00.000
-1	ENTERPRISE	2024-01-12 00:00:00.000		2024-01-12 10:01:05.000	true	2024-01-12 10:01:05.000		true	INTERNAL	USA	USD	103.00000	2025-12-01 00:00:00.000
-2	BLOOMBERG	2023-05-10 00:00:00.000	2023-08-31 23:59:59.000	2023-05-10 00:00:00.000	false	2023-05-10 00:00:00.000	2023-08-31 23:59:59.000	false	VENDOR	CAN	CAD	1500.00000	2028-06-15 00:00:00.000
-2	BLOOMBERG	2023-09-01 00:00:00.000	2024-06-30 23:59:59.000	2023-09-01 00:00:00.000	false	2023-09-01 00:00:00.000	2024-06-30 23:59:59.000	false	VENDOR	CAN	CAD	1512.25000	2028-06-15 00:00:00.000
-2	BLOOMBERG	2024-07-01 00:00:00.000		2024-07-01 00:00:00.000	true	2024-07-01 00:00:00.000		true	VENDOR	CAN	CAD	1515.00000	2028-06-15 00:00:00.000
-3	ENTERPRISE	2022-01-01 00:00:00.000	2022-12-31 23:59:59.000	2022-01-01 00:00:00.000	false	2022-01-01 00:00:00.000	2022-12-31 23:59:59.000	false	INTERNAL	GBR	GBP	85.20000	2025-01-01 00:00:00.000
-3	ENTERPRISE	2023-01-01 00:00:00.000	2023-06-30 23:59:59.000	2023-01-01 00:00:00.000	false	2023-01-01 00:00:00.000	2023-06-30 23:59:59.000	false	INTERNAL	GBR	GBP	90.00000	2025-01-01 00:00:00.000
-3	ENTERPRISE	2023-07-01 00:00:00.000		2023-07-01 00:00:00.000	true	2023-07-01 00:00:00.000		true	INTERNAL	GBR	GBP	92.50000	2025-01-01 00:00:00.000
-"""
-    
-    # Note: The delta data no longer includes 'DATA_PROVIDER_TYPE'
+    # Delta DOES NOT carry END_TMS; “NaN/NaT” in data cols means “unchanged”
     delta_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
-1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	USA	USD	102.00000	
-1	ENTERPRISE	2024-01-12 00:00:00.000	2024-01-20 00:00:00.000	USA	USD	103.00000	
+1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	NaN	NaN	NaN	2040-01-01 00:00:00.000
+1	ENTERPRISE	2024-01-12 00:00:00.000	2024-01-20 00:00:00.000	NaN	NaN	104.00000	NaT
 """
 
-    delta_tsv_unused = """
-ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
-1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	USA	USD	101.00000	2030-01-01 00:00:00.000
-1	ENTERPRISE	2024-01-12 00:00:00.000	2024-01-20 00:00:00.000	USA	USD	103.00000	2025-12-01 00:00:00.000
-2	BLOOMBERG	2023-05-10 00:00:00.000	2023-06-01 00:00:00.000	CAN	CAD	1500.00000	2028-06-16 00:00:00.000
-2	BLOOMBERG	2023-09-01 00:00:00.000	2023-09-15 00:00:00.000	CAN	$$DELETED$$	1512.25000	2028-06-15 00:00:00.000
-2	BLOOMBERG	2024-07-01 00:00:00.000	2024-07-10 00:00:00.000	CAN	CAD	1515.00000	2028-06-15 00:00:00.000
-2	BLOOMBERG	2025-01-01 00:00:00.000	2024-12-15 00:00:00.000	CAN	CAD	1525.00000	2028-06-16 00:00:00.000
-3	ENTERPRISE	2022-01-01 00:00:00.000	2022-02-01 00:00:00.000	GBR	GBP	85.20000	2025-01-01 00:00:00.000
-3	ENTERPRISE	2023-07-01 00:00:00.000	2023-07-02 00:00:00.000	GBR	GBP	1234567890.12345	2025-01-01 00:00:00.000
-3	ENTERPRISE	2026-03-01 00:00:00.000	2025-12-01 00:00:00.000	GBR	GBP	92.50000	2025-01-01 00:00:00.000
-4	EXTEL	2023-07-20 00:00:00.000	2023-07-20 00:00:00.000	JPN	JPY	25000.00000	2035-01-01 00:00:00.000
-"""    
-    # Read the TSV data into Pandas DataFrames
-    df_history = pd.read_csv(io.StringIO(history_tsv), sep='\t', parse_dates=[
+    # Read inputs
+    df_history = pd.read_csv(io.StringIO(history_tsv), sep="\t", parse_dates=[
         "START_TMS", "END_TMS", "LAST_CHG_TMS", "TXN_START_TMS", "TXN_END_TMS", "ASSET_MATURITY_TMS"
     ])
-    df_delta = pd.read_csv(io.StringIO(delta_tsv), sep='\t', parse_dates=[
+    df_delta = pd.read_csv(io.StringIO(delta_tsv), sep="\t", parse_dates=[
         "START_TMS", "LAST_CHG_TMS", "ASSET_MATURITY_TMS"
     ])
 
-    # --- 2. Unify and Prepare DataFrames ---
-    # We only need the key columns and the data columns from the history
-    df_history_simple = df_history[['ASSET_ID', 'DATA_PROVIDER', 'START_TMS', 'LAST_CHG_TMS',
-                                   'DATA_PROVIDER_TYPE', 'ASSET_COUNTRY', 'ASSET_CURRENCY',
-                                   'ASSET_PRICE', 'ASSET_MATURITY_TMS']]
+    # Build a lookup for historical END_TMS by (ASSET_ID, DATA_PROVIDER, START_TMS)
+    hist_end_lookup = (
+        df_history[["ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS"]]
+        .drop_duplicates()
+        .set_index(["ASSET_ID", "DATA_PROVIDER", "START_TMS"])["END_TMS"]
+    )
 
-    # The delta data is concatenated with the history, but it lacks 'DATA_PROVIDER_TYPE'.
-    # We'll fill this missing column by forward-filling later.
-    df_unified = pd.concat([df_history_simple, df_delta], ignore_index=True, sort=False)
+    # --- 2) Historical update propagation ---
+    # If Delta updates a past start, propagate to future contiguous rows that shared the
+    # same value(s) in the changed column(s) at that time, creating a new txn version for each.
+    extra_versions = []
+    data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
 
-    # Sort by valid-time (START_TMS) then transaction-time (LAST_CHG_TMS) to establish chronology
-    df_unified.sort_values(by=['ASSET_ID', 'DATA_PROVIDER', 'START_TMS', 'LAST_CHG_TMS'], inplace=True)
+    for _, d in df_delta.iterrows():
+        asset_id = d["ASSET_ID"]
+        provider = d["DATA_PROVIDER"]
+        start_tms = d["START_TMS"]
+        txn_start = d["LAST_CHG_TMS"]
 
-    # --- 3. Handle Deletion Sentinels & Propagate Values ---
-    # Define a map for deletion sentinels by column name
+        # Find matching historical row (same valid start)
+        hist_match = df_history[
+            (df_history["ASSET_ID"] == asset_id) &
+            (df_history["DATA_PROVIDER"] == provider) &
+            (df_history["START_TMS"] == start_tms)
+        ].sort_values("LAST_CHG_TMS")
+
+        if hist_match.empty:
+            # If Delta introduces a brand new valid period (no matching START_TMS in history),
+            # leave END_TMS as NaT (open) here; it may be closed later by another delta, not by recompute.
+            continue
+
+        hist_row = hist_match.iloc[-1]  # latest txn for that valid start at the time
+
+        # Identify which data columns actually change in this delta
+        changed_cols = []
+        for c in data_cols:
+            if pd.notna(d[c]) and (d[c] != hist_row[c]):
+                changed_cols.append(c)
+
+        if not changed_cols:
+            continue
+
+        # Future contiguous rows with the same values (for changed columns) as hist_row
+        future_rows = df_history[
+            (df_history["ASSET_ID"] == asset_id) &
+            (df_history["DATA_PROVIDER"] == provider) &
+            (df_history["START_TMS"] > hist_row["START_TMS"])
+        ].sort_values("START_TMS")
+
+        contiguous = []
+        for _, f in future_rows.iterrows():
+            # Stop as soon as one of the changed columns differs from the "pre-change" value
+            if any(f[c] != hist_row[c] for c in changed_cols):
+                break
+            contiguous.append(f)
+
+        # Create new txn versions for those future rows (preserving their valid END_TMS)
+        if contiguous:
+            cont_df = pd.DataFrame(contiguous)
+            for _, r in cont_df.iterrows():
+                new_version = r.copy()
+                for c in changed_cols:
+                    new_version[c] = d[c]
+                new_version["LAST_CHG_TMS"] = txn_start
+                # Preserve the original valid END_TMS for that period
+                new_version["END_TMS"] = r["END_TMS"]
+                extra_versions.append(new_version)
+
+    # Add propagated versions into delta set
+    if extra_versions:
+        df_delta = pd.concat([df_delta, pd.DataFrame(extra_versions)], ignore_index=True, sort=False)
+
+    # --- 3) Attach the historical END_TMS to *all* delta rows that correspond to historical starts ---
+    # (Rows that are truly new valid periods will remain END_TMS = NaT / None.)
+    if "END_TMS" not in df_delta.columns:
+        df_delta["END_TMS"] = pd.NaT
+    # Map in END_TMS for any delta row with an existing historical START_TMS
+    keys = list(zip(df_delta["ASSET_ID"], df_delta["DATA_PROVIDER"], df_delta["START_TMS"]))
+    df_delta["END_TMS"] = [
+        df_delta.loc[i, "END_TMS"] if pd.notna(df_delta.loc[i, "END_TMS"]) else hist_end_lookup.get(k, pd.NaT)
+        for i, k in enumerate(keys)
+    ]
+
+    # --- 4) Unify history + delta (do NOT recompute END_TMS) ---
+    keep_cols = [
+        "ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS",
+        "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
+    ]
+    df_history_simple = df_history[keep_cols]
+    df_unified = pd.concat([df_history_simple, df_delta[keep_cols]], ignore_index=True, sort=False)
+
+    # Sort to establish chronology for forward-fill and TXN_END_TMS calc
+    df_unified = df_unified.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
+
+    # --- 5) Handle deletion sentinels and forward-fill only data columns (NOT END_TMS) ---
     sentinel_map = {
-        # 'DATA_PROVIDER_TYPE' is no longer a data column and has been removed from this map.
-        "ASSET_COUNTRY": '$$DELETED$$',
-        "ASSET_CURRENCY": '$$DELETED$$',
+        "ASSET_COUNTRY": "$$DELETED$$",
+        "ASSET_CURRENCY": "$$DELETED$$",
         "ASSET_PRICE": 1234567890.12345,
-        "ASSET_MATURITY_TMS": datetime.datetime(1900, 1, 1)
+        "ASSET_MATURITY_TMS": datetime.datetime(1900, 1, 1),
     }
-    
-    # Create copies of the original data to preserve deletion sentinels for a moment
-    df_propagated = df_unified.copy()
-    
-    # Identify and replace sentinel values with NaN for forward-fill logic
+    df_ff = df_unified.copy()
     for col_name, sentinel_value in sentinel_map.items():
-        if col_name in df_propagated.columns:
-            if df_propagated[col_name].dtype == 'object': # Handle string sentinels
-                df_propagated.loc[df_propagated[col_name] == sentinel_value, col_name] = pd.NA
-            else: # Handle numeric/datetime sentinels
-                df_propagated.loc[df_propagated[col_name] == sentinel_value, col_name] = None
-    
-    # Forward-fill missing values within each asset's timeline
-    # 'DATA_PROVIDER_TYPE' has been removed from the data columns list.
-    data_cols = ['ASSET_COUNTRY', 'ASSET_CURRENCY', 'ASSET_PRICE', 'ASSET_MATURITY_TMS']
-    df_propagated[data_cols] = df_propagated.groupby(['ASSET_ID', 'DATA_PROVIDER'])[data_cols].ffill()
+        if col_name in df_ff.columns:
+            if df_ff[col_name].dtype == "object":
+                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NA
+            else:
+                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = None
 
-    # Also forward-fill the 'DATA_PROVIDER_TYPE' since it's a key attribute.
-    # This ensures that new delta records get the correct type from the history.
-    df_propagated['DATA_PROVIDER_TYPE'] = df_propagated.groupby(['ASSET_ID', 'DATA_PROVIDER'])['DATA_PROVIDER_TYPE'].ffill()
-    
-    # --- 4. Filter for Actual Changes and New Versions ---
-    # Drop duplicates where the data hasn't changed. We group by all data columns
-    # and keep the first occurrence of a change.
-    df_deduped = df_propagated.drop_duplicates(
-        subset=['ASSET_ID', 'DATA_PROVIDER', 'START_TMS', 'DATA_PROVIDER_TYPE'] + data_cols,
-        keep='first'
-    )
-    
-    # --- 5. Reconstruct Bi-Temporal Axes ---
-    # Create the TXN_END_TMS by looking at the next LAST_CHG_TMS
-    df_deduped['TXN_END_TMS'] = df_deduped.groupby(['ASSET_ID', 'DATA_PROVIDER', 'START_TMS'])['LAST_CHG_TMS'].shift(-1)
-    # The transaction end time is one second before the next transaction starts
-    df_deduped['TXN_END_TMS'] = df_deduped['TXN_END_TMS'] - pd.to_timedelta(1, unit='s')
-    
-    # Create the END_TMS by looking at the next START_TMS
-    df_deduped['END_TMS'] = df_deduped.groupby(['ASSET_ID', 'DATA_PROVIDER'])['START_TMS'].shift(-1)
-    # The valid end time is one second before the next valid start time
-    df_deduped['END_TMS'] = df_deduped['END_TMS'] - pd.to_timedelta(1, unit='s')
-    
-    # Re-calculate the IS_CURRENT and IS_LATEST_TXN flags
-    df_deduped['IS_CURRENT'] = df_deduped['END_TMS'].isna()
-    df_deduped['IS_LATEST_TXN'] = df_deduped['TXN_END_TMS'].isna()
+    # Forward-fill "unchanged" data fields inside each asset/provider timeline
+    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)[data_cols].ffill()
+    df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
 
-    # --- 6. Final Clean-up and Ordering ---
-    # Rename the column for clarity
-    final_df = df_deduped.rename(columns={'LAST_CHG_TMS': 'TXN_START_TMS'}).sort_values(
-        by=['ASSET_ID', 'DATA_PROVIDER', 'START_TMS', 'TXN_START_TMS']
+    # --- 6) Drop duplicates by *valid* state (keep all txn versions!) ---
+    # Important: We keep LAST_CHG_TMS so we do NOT collapse different transactions.
+    # We dedup rows that are literally identical across both valid-time and data columns + LAST_CHG_TMS.
+    df_ff = df_ff.drop_duplicates(
+        subset=[
+            "ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS",
+            "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
+        ],
+        keep="first"
     )
-    
-    # Order the columns for the final output
-    final_df = final_df[[
-        "ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE", "START_TMS", "END_TMS",
-        "TXN_START_TMS", "TXN_END_TMS", "IS_CURRENT", "IS_LATEST_TXN",
+
+    # --- 7) Rebuild transaction-time fields (TXN_START/END) per valid start ---
+    # TXN_START_TMS := LAST_CHG_TMS
+    df_ff = df_ff.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
+    df_ff["TXN_START_TMS"] = df_ff["LAST_CHG_TMS"]
+    df_ff["TXN_END_TMS"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"])["TXN_START_TMS"].shift(-1)
+    df_ff["TXN_END_TMS"] = df_ff["TXN_END_TMS"] - pd.to_timedelta(1, unit="s")
+
+    # --- 8) Derive bitemporal flags ---
+    # IS_CURRENT is strictly based on valid-time END_TMS
+    df_ff["IS_CURRENT"] = df_ff["END_TMS"].isna()
+    # Latest transaction for a valid start has TXN_END_TMS = null
+    df_ff["IS_LATEST_TXN"] = df_ff["TXN_END_TMS"].isna()
+
+    # --- 9) Final column order and sentinel re-application for nulls (if desired) ---
+    final_df = df_ff[[
+        "ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE",
+        "START_TMS", "END_TMS",
+        "TXN_START_TMS", "TXN_END_TMS",
+        "IS_CURRENT", "IS_LATEST_TXN",
         "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
-    ]]
-    
-    # Now, we re-propagate the deletion sentinels to their correct values
-    for col_name, sentinel_value in sentinel_map.items():
-        if final_df[col_name].dtype == 'object':
-            final_df.loc[final_df[col_name].isna(), col_name] = sentinel_value
-        else:
-            final_df.loc[final_df[col_name].isna(), col_name] = sentinel_value
+    ]].reset_index(drop=True)
 
-    return final_df.reset_index(drop=True)
+    # Note: we intentionally DO NOT transform NaT END_TMS to any sentinel.
+    # Only data columns (country/currency/price/maturity) may need sentinel reapplication if you want.
+    # Leaving them as true NULLs is generally best for Snowflake.
+
+    return final_df
