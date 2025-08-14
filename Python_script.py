@@ -37,7 +37,7 @@ ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	T
     delta_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
 1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	NaN	NaN	NaN	2040-01-01 00:00:00.000
-1	ENTERPRISE	2024-01-12 00:00:00.000	2024-01-20 00:00:00.000	NaN	NaN	104.00000	NaT
+1	ENTERPRISE	2025-01-12 00:00:00.000	2025-01-12 00:00:00.000	NaN	NaN	105.00000	NaT
 """
 
     # Read inputs
@@ -75,8 +75,20 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
         ].sort_values("LAST_CHG_TMS")
 
         if hist_match.empty:
-            # If Delta introduces a brand new valid period (no matching START_TMS in history),
-            # leave END_TMS as NaT (open) here; it may be closed later by another delta, not by recompute.
+            # *** MODIFIED LOGIC START ***
+            # If Delta introduces a brand new valid period, find the currently open record
+            # and close it by setting its END_TMS to the new delta's START_TMS - 1 second.
+            open_hist = df_history[
+                (df_history["ASSET_ID"] == asset_id) &
+                (df_history["DATA_PROVIDER"] == provider) &
+                (df_history["END_TMS"].isna())
+            ]
+            if not open_hist.empty:
+                closed_version = open_hist.iloc[0].copy()
+                closed_version["END_TMS"] = start_tms - pd.to_timedelta(1, "s")
+                closed_version["LAST_CHG_TMS"] = txn_start
+                extra_versions.append(closed_version)
+            # *** MODIFIED LOGIC END ***
             continue
 
         hist_row = hist_match.iloc[-1]  # latest txn for that valid start at the time
