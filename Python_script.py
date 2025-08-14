@@ -37,7 +37,7 @@ ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	T
     delta_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
 1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	NaN	NaN	NaN	2040-01-01 00:00:00.000
-1	ENTERPRISE	2025-01-12 00:00:00.000	2025-01-12 00:00:00.000	NaN	NaN	105.00000	NaT
+1	ENTERPRISE	2025-01-12 00:00:00.000	2025-01-12 00:00:00.000	NaN	NaN	1234567890.12345	NaT
 """
 
     # Read inputs
@@ -155,23 +155,31 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     df_unified = df_unified.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
 
     # --- 5) Handle deletion sentinels and forward-fill only data columns (NOT END_TMS) ---
+    # **MODIFIED LOGIC START**
+    # Reversing the order of these operations to ensure ffill does not overwrite deletions.
+    df_ff = df_unified.copy()
+    data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    
+    # First, perform forward-fill on columns where values are missing (NaN/NaT)
+    # This fills in unchanged data from historical records.
+    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)[data_cols].ffill()
+    df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
+
+    # Second, handle deletion sentinels. This will overwrite any ffilled values
+    # if the original delta specified a deletion.
     sentinel_map = {
         "ASSET_COUNTRY": "$$DELETED$$",
         "ASSET_CURRENCY": "$$DELETED$$",
         "ASSET_PRICE": 1234567890.12345,
         "ASSET_MATURITY_TMS": datetime.datetime(1900, 1, 1),
     }
-    df_ff = df_unified.copy()
     for col_name, sentinel_value in sentinel_map.items():
         if col_name in df_ff.columns:
             if df_ff[col_name].dtype == "object":
                 df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NA
             else:
                 df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = None
-
-    # Forward-fill "unchanged" data fields inside each asset/provider timeline
-    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)[data_cols].ffill()
-    df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
+    # **MODIFIED LOGIC END**
 
     # --- 6) Drop duplicates by *valid* state (keep all txn versions!) ---
     # Important: We keep LAST_CHG_TMS so we do NOT collapse different transactions.
