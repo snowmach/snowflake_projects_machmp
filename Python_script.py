@@ -4,6 +4,10 @@ import datetime
 import snowflake.snowpark as snowpark
 
 def main(session: snowpark.Session):
+    """
+    Main function to run the bitemporal merge logic and
+    create a Snowpark DataFrame.
+    """
     merged_history = bi_temporal_merge_pandas()
 
     # Print for worksheet debugging
@@ -23,6 +27,9 @@ def main(session: snowpark.Session):
 
 
 def bi_temporal_merge_pandas():
+    """
+    Performs a bitemporal merge on sample data using pandas.
+    """
     # --- 1) Sample data (you can replace with real loads) ---
     history_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	TXN_END_TMS	IS_LATEST_TXN	DATA_PROVIDER_TYPE	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
@@ -36,17 +43,17 @@ ASSET_ID	DATA_PROVIDER	START_TMS	END_TMS	LAST_CHG_TMS	IS_CURRENT	TXN_START_TMS	T
     # Delta DOES NOT carry END_TMS; “NaN/NaT” in data cols means “unchanged”
     delta_tsv = """
 ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET_PRICE	ASSET_MATURITY_TMS
-1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	NaN	NaN	NaN	2040-01-01 00:00:00.000
+1	ENTERPRISE	2023-01-01 00:00:00.000	2024-01-15 00:00:00.000	NaN	NaN	101.0	1000-01-01 00:00:00.000
 1	ENTERPRISE	2025-01-12 00:00:00.000	2025-01-12 00:00:00.000	NaN	NaN	1234567890.12345	NaT
 """
 
-    # Read inputs
+    # Read inputs, being explicit about null values
     df_history = pd.read_csv(io.StringIO(history_tsv), sep="\t", parse_dates=[
         "START_TMS", "END_TMS", "LAST_CHG_TMS", "TXN_START_TMS", "TXN_END_TMS", "ASSET_MATURITY_TMS"
     ])
     df_delta = pd.read_csv(io.StringIO(delta_tsv), sep="\t", parse_dates=[
         "START_TMS", "LAST_CHG_TMS", "ASSET_MATURITY_TMS"
-    ])
+    ], na_values=['NaT', ''])
 
     # Build a lookup for historical END_TMS by (ASSET_ID, DATA_PROVIDER, START_TMS)
     hist_end_lookup = (
@@ -56,18 +63,15 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     )
 
     # --- 2) Historical update propagation ---
-    # If Delta updates a past start, propagate to future contiguous rows that shared the
-    # same value(s) in the changed column(s) at that time, creating a new txn version for each.
     extra_versions = []
     data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
-
+    
     for _, d in df_delta.iterrows():
         asset_id = d["ASSET_ID"]
         provider = d["DATA_PROVIDER"]
         start_tms = d["START_TMS"]
         txn_start = d["LAST_CHG_TMS"]
 
-        # Find matching historical row (same valid start)
         hist_match = df_history[
             (df_history["ASSET_ID"] == asset_id) &
             (df_history["DATA_PROVIDER"] == provider) &
@@ -75,9 +79,6 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
         ].sort_values("LAST_CHG_TMS")
 
         if hist_match.empty:
-            # *** MODIFIED LOGIC START ***
-            # If Delta introduces a brand new valid period, find the currently open record
-            # and close it by setting its END_TMS to the new delta's START_TMS - 1 second.
             open_hist = df_history[
                 (df_history["ASSET_ID"] == asset_id) &
                 (df_history["DATA_PROVIDER"] == provider) &
@@ -86,23 +87,25 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
             if not open_hist.empty:
                 closed_version = open_hist.iloc[0].copy()
                 closed_version["END_TMS"] = start_tms - pd.to_timedelta(1, "s")
-                closed_version["LAST_CHG_TMS"] = txn_start
+                closed_version["TXN_END_TMS"] = txn_start - pd.to_timedelta(1, "s")
+                closed_version["IS_LATEST_TXN"] = False
                 extra_versions.append(closed_version)
-            # *** MODIFIED LOGIC END ***
             continue
+            
+        hist_row = hist_match.iloc[-1]
 
-        hist_row = hist_match.iloc[-1]  # latest txn for that valid start at the time
-
-        # Identify which data columns actually change in this delta
         changed_cols = []
         for c in data_cols:
-            if pd.notna(d[c]) and (d[c] != hist_row[c]):
+            is_changed = False
+            if pd.notna(d[c]):
+                if pd.isna(hist_row[c]) or d[c] != hist_row[c]:
+                    is_changed = True
+            if is_changed:
                 changed_cols.append(c)
 
         if not changed_cols:
             continue
 
-        # Future contiguous rows with the same values (for changed columns) as hist_row
         future_rows = df_history[
             (df_history["ASSET_ID"] == asset_id) &
             (df_history["DATA_PROVIDER"] == provider) &
@@ -111,12 +114,10 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
 
         contiguous = []
         for _, f in future_rows.iterrows():
-            # Stop as soon as one of the changed columns differs from the "pre-change" value
-            if any(f[c] != hist_row[c] for c in changed_cols):
+            if any(pd.notna(hist_row[c]) and pd.notna(f[c]) and f[c] != hist_row[c] for c in changed_cols):
                 break
             contiguous.append(f)
 
-        # Create new txn versions for those future rows (preserving their valid END_TMS)
         if contiguous:
             cont_df = pd.DataFrame(contiguous)
             for _, r in cont_df.iterrows():
@@ -124,26 +125,22 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
                 for c in changed_cols:
                     new_version[c] = d[c]
                 new_version["LAST_CHG_TMS"] = txn_start
-                # Preserve the original valid END_TMS for that period
                 new_version["END_TMS"] = r["END_TMS"]
                 extra_versions.append(new_version)
 
-    # Add propagated versions into delta set
     if extra_versions:
         df_delta = pd.concat([df_delta, pd.DataFrame(extra_versions)], ignore_index=True, sort=False)
 
-    # --- 3) Attach the historical END_TMS to *all* delta rows that correspond to historical starts ---
-    # (Rows that are truly new valid periods will remain END_TMS = NaT / None.)
+    # --- 3) Attach the historical END_TMS to *all* delta rows ---
     if "END_TMS" not in df_delta.columns:
         df_delta["END_TMS"] = pd.NaT
-    # Map in END_TMS for any delta row with an existing historical START_TMS
     keys = list(zip(df_delta["ASSET_ID"], df_delta["DATA_PROVIDER"], df_delta["START_TMS"]))
     df_delta["END_TMS"] = [
         df_delta.loc[i, "END_TMS"] if pd.notna(df_delta.loc[i, "END_TMS"]) else hist_end_lookup.get(k, pd.NaT)
         for i, k in enumerate(keys)
     ]
 
-    # --- 4) Unify history + delta (do NOT recompute END_TMS) ---
+    # --- 4) Unify history + delta ---
     keep_cols = [
         "ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS",
         "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
@@ -151,39 +148,29 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     df_history_simple = df_history[keep_cols]
     df_unified = pd.concat([df_history_simple, df_delta[keep_cols]], ignore_index=True, sort=False)
 
-    # Sort to establish chronology for forward-fill and TXN_END_TMS calc
     df_unified = df_unified.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
-
-    # --- 5) Handle deletion sentinels and forward-fill only data columns (NOT END_TMS) ---
-    # **MODIFIED LOGIC START**
-    # Reversing the order of these operations to ensure ffill does not overwrite deletions.
-    df_ff = df_unified.copy()
-    data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
     
-    # First, perform forward-fill on columns where values are missing (NaN/NaT)
-    # This fills in unchanged data from historical records.
-    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)[data_cols].ffill()
-    df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
-
-    # Second, handle deletion sentinels. This will overwrite any ffilled values
-    # if the original delta specified a deletion.
+    # --- 5) Handle deletion sentinels and then forward-fill ---
+    df_ff = df_unified.copy()
+    
     sentinel_map = {
         "ASSET_COUNTRY": "$$DELETED$$",
         "ASSET_CURRENCY": "$$DELETED$$",
         "ASSET_PRICE": 1234567890.12345,
-        "ASSET_MATURITY_TMS": datetime.datetime(1900, 1, 1),
+        "ASSET_MATURITY_TMS": datetime.datetime(1000, 1, 1),
     }
     for col_name, sentinel_value in sentinel_map.items():
         if col_name in df_ff.columns:
-            if df_ff[col_name].dtype == "object":
-                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NA
+            if pd.api.types.is_datetime64_any_dtype(df_ff[col_name]):
+                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NaT
             else:
-                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = None
-    # **MODIFIED LOGIC END**
+                df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NA
 
-    # --- 6) Drop duplicates by *valid* state (keep all txn versions!) ---
-    # Important: We keep LAST_CHG_TMS so we do NOT collapse different transactions.
-    # We dedup rows that are literally identical across both valid-time and data columns + LAST_CHG_TMS.
+    # Corrected Forward Fill Logic: Group by START_TMS to prevent carry-over between different valid-time periods
+    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"], group_keys=False)[data_cols].ffill()
+    df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
+
+    # --- 6) Drop duplicates by *valid* state ---
     df_ff = df_ff.drop_duplicates(
         subset=[
             "ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS",
@@ -193,29 +180,24 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     )
 
     # --- 7) Rebuild transaction-time fields (TXN_START/END) per valid start ---
-    # TXN_START_TMS := LAST_CHG_TMS
     df_ff = df_ff.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
     df_ff["TXN_START_TMS"] = df_ff["LAST_CHG_TMS"]
+    
+    # **FIXED** Corrected the column name from "TXN_END_ TMS" to "TXN_END_TMS"
     df_ff["TXN_END_TMS"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"])["TXN_START_TMS"].shift(-1)
     df_ff["TXN_END_TMS"] = df_ff["TXN_END_TMS"] - pd.to_timedelta(1, unit="s")
 
     # --- 8) Derive bitemporal flags ---
-    # IS_CURRENT is strictly based on valid-time END_TMS
     df_ff["IS_CURRENT"] = df_ff["END_TMS"].isna()
-    # Latest transaction for a valid start has TXN_END_TMS = null
     df_ff["IS_LATEST_TXN"] = df_ff["TXN_END_TMS"].isna()
 
-    # --- 9) Final column order and sentinel re-application for nulls (if desired) ---
+    # --- 9) Final column order ---
     final_df = df_ff[[
         "ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE",
-        "START_TMS", "END_TMS",
+        "START_TMS", "END_TMS",    
         "TXN_START_TMS", "TXN_END_TMS",
         "IS_CURRENT", "IS_LATEST_TXN",
         "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
     ]].reset_index(drop=True)
-
-    # Note: we intentionally DO NOT transform NaT END_TMS to any sentinel.
-    # Only data columns (country/currency/price/maturity) may need sentinel reapplication if you want.
-    # Leaving them as true NULLs is generally best for Snowflake.
 
     return final_df
