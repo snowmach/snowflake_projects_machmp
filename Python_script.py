@@ -166,8 +166,20 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
             else:
                 df_ff.loc[df_ff[col_name] == sentinel_value, col_name] = pd.NA
 
+    #Per-column forward-fill, skipping rows set to null by sentinel
+    for col in data_cols:
+        sentinel_value = sentinel_map[col]
+        sentinel_mask = df_unified[col] == sentinel_value
+
+        mask = df_ff[col].isna() & (~sentinel_mask)
+        df_ff.loc[mask, col] = (
+            df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)[col]
+            .ffill()
+            .loc[mask]
+        )
+
     # Corrected Forward Fill Logic: Group by START_TMS to prevent carry-over between different valid-time periods
-    df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"], group_keys=False)[data_cols].ffill()
+    #df_ff[data_cols] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"], group_keys=False)[data_cols].ffill()
     df_ff["DATA_PROVIDER_TYPE"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER"], group_keys=False)["DATA_PROVIDER_TYPE"].ffill()
 
     # --- 6) Drop duplicates by *valid* state ---
@@ -183,7 +195,6 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     df_ff = df_ff.sort_values(by=["ASSET_ID", "DATA_PROVIDER", "START_TMS", "LAST_CHG_TMS"], kind="mergesort")
     df_ff["TXN_START_TMS"] = df_ff["LAST_CHG_TMS"]
     
-    # **FIXED** Corrected the column name from "TXN_END_ TMS" to "TXN_END_TMS"
     df_ff["TXN_END_TMS"] = df_ff.groupby(["ASSET_ID", "DATA_PROVIDER", "START_TMS"])["TXN_START_TMS"].shift(-1)
     df_ff["TXN_END_TMS"] = df_ff["TXN_END_TMS"] - pd.to_timedelta(1, unit="s")
 
@@ -194,7 +205,7 @@ ASSET_ID	DATA_PROVIDER	START_TMS	LAST_CHG_TMS	ASSET_COUNTRY	ASSET_CURRENCY	ASSET
     # --- 9) Final column order ---
     final_df = df_ff[[
         "ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE",
-        "START_TMS", "END_TMS",    
+        "START_TMS", "END_TMS", "LAST_CHG_TMS",   
         "TXN_START_TMS", "TXN_END_TMS",
         "IS_CURRENT", "IS_LATEST_TXN",
         "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"
