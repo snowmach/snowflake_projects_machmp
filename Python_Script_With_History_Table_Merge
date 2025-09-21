@@ -1,0 +1,247 @@
+import pandas as pd
+import datetime
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import when_matched, when_not_matched
+from zoneinfo import ZoneInfo # Correctly handle timezones
+
+def merge_bitemporal_data(session: snowpark.Session):
+    """
+    Main orchestrator function for the scalable bitemporal merge process.
+    (Final version with robust timezone handling).
+    """
+    print("🚀 Starting bitemporal merge process...")
+
+    # === Step 1: Isolate Relevant History from Snowflake ===
+    
+    try:
+        delta_keys_df = session.table("public.delta_interim").select("ASSET_ID").distinct()
+        delta_count = delta_keys_df.count()
+        if delta_count == 0:
+            print("Delta table is empty. No new data to merge. Exiting.")
+            return "✅ Success: No new data to merge."
+        print(f"Found {delta_count} unique asset IDs in the delta table.")
+    except Exception as e:
+        print(f"⚠️ Error reading from delta_interim table: {e}")
+        print("Assuming delta table is empty. Exiting.")
+        return "✅ Success: No new data to merge."
+
+    history_subset_snowpark_df = session.table("public.asset_data_history").join(
+        delta_keys_df, on=["ASSET_ID"]
+    )
+    
+    df_history_subset = history_subset_snowpark_df.to_pandas()
+    df_delta = session.table("public.delta_interim").to_pandas()
+
+    print(f"Fetched {len(df_history_subset)} relevant history records to process.")
+
+    # === Step 2: Generate the "Correct State" in Python ===
+
+    final_df = bi_temporal_merge_pandas(df_history_subset, df_delta)
+    print(f"Generated a final state of {len(final_df)} records.")
+
+    if final_df.empty:
+        print("Processing resulted in an empty dataframe. No changes to apply.")
+        return "✅ Success: No changes to apply."
+
+    # === Step 3: Identify True Deltas (Inserts and Updates) ===
+    
+    bitemporal_key = ["ASSET_ID", "START_TMS", "LAST_CHG_TMS"]
+    
+    comparison_df = pd.merge(
+        df_history_subset,
+        final_df,
+        on=bitemporal_key,
+        how='outer',
+        suffixes=('_hist', '_final'),
+        indicator=True
+    )
+    
+    final_cols_suffixed = [c for c in comparison_df.columns if c.endswith('_final')]
+    rename_dict = {c: c.replace('_final', '') for c in final_cols_suffixed}
+    inserts_df = comparison_df[comparison_df['_merge'] == 'right_only']
+    inserts_df = inserts_df[bitemporal_key + final_cols_suffixed].rename(columns=rename_dict)
+    
+    print(f"Identified {len(inserts_df)} new records to insert.")
+    
+    updates_df = comparison_df[comparison_df['_merge'] == 'both']
+    update_mask = (
+        (updates_df['TXN_END_TMS_hist'].fillna(pd.Timestamp(0)) != updates_df['TXN_END_TMS_final'].fillna(pd.Timestamp(0))) |
+        (updates_df['IS_LATEST_TXN_hist'] != updates_df['IS_LATEST_TXN_final'])
+    )
+    
+    updates_to_apply = updates_df[update_mask][bitemporal_key + ['TXN_END_TMS_final', 'IS_LATEST_TXN_final']]
+    updates_to_apply = updates_to_apply.rename(columns={
+        'TXN_END_TMS_final': 'TXN_END_TMS',
+        'IS_LATEST_TXN_final': 'IS_LATEST_TXN'
+    })
+    print(f"Identified {len(updates_to_apply)} existing records to update.")
+
+    # === Step 4: Execute the MERGE in Snowflake ===
+
+    # **Set up auditing fields using robust timezone conversion**
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    # Convert UTC time to US Central Time, correctly handling CDT/CST
+    cst_time_aware = utc_now.astimezone(ZoneInfo("America/Chicago"))
+    # Create a timezone-naive timestamp for storage
+    cst_time_naive = cst_time_aware.replace(tzinfo=None)
+    mesh_run_id = f"TEST_{cst_time_naive.strftime('%Y%m%d_%H%M%S')}"
+
+    history_table = session.table("public.asset_data_history")
+
+    if not inserts_df.empty:
+        inserts_df['MESH_INSRT_TS'] = cst_time_naive
+        inserts_df['MESH_LAST_UPDATE_TS'] = cst_time_naive
+        inserts_df['MESH_RUN_ID'] = mesh_run_id
+
+        for col_name in ["START_TMS", "END_TMS", "LAST_CHG_TMS", "TXN_START_TMS", "TXN_END_TMS", "ASSET_MATURITY_TMS", "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS"]:
+            if col_name in inserts_df.columns:
+                inserts_df[col_name] = pd.to_datetime(inserts_df[col_name], errors='coerce')
+        
+        inserts_snowpark_df = session.create_dataframe(inserts_df)
+        
+        insert_merge_result = history_table.merge(
+            source=inserts_snowpark_df,
+            join_expr=(history_table["ASSET_ID"] == inserts_snowpark_df["ASSET_ID"]) &
+                      (history_table["START_TMS"] == inserts_snowpark_df["START_TMS"]) &
+                      (history_table["LAST_CHG_TMS"] == inserts_snowpark_df["LAST_CHG_TMS"]),
+            clauses=[when_not_matched().insert({c: inserts_snowpark_df[c] for c in inserts_snowpark_df.columns})]
+        )
+        print("Merge results for inserts:")
+        print(insert_merge_result)
+
+    if not updates_to_apply.empty:
+        updates_to_apply['MESH_LAST_UPDATE_TS'] = cst_time_naive
+        updates_to_apply['MESH_RUN_ID'] = mesh_run_id
+        
+        for col_name in ["START_TMS", "LAST_CHG_TMS", "TXN_END_TMS", "MESH_LAST_UPDATE_TS"]:
+            if col_name in updates_to_apply.columns:
+                updates_to_apply[col_name] = pd.to_datetime(updates_to_apply[col_name], errors='coerce')
+
+        updates_snowpark_df = session.create_dataframe(updates_to_apply)
+        
+        update_merge_result = history_table.merge(
+            source=updates_snowpark_df,
+            join_expr=(history_table["ASSET_ID"] == updates_snowpark_df["ASSET_ID"]) &
+                      (history_table["START_TMS"] == updates_snowpark_df["START_TMS"]) &
+                      (history_table["LAST_CHG_TMS"] == updates_snowpark_df["LAST_CHG_TMS"]),
+            clauses=[when_matched().update({
+                "TXN_END_TMS": updates_snowpark_df["TXN_END_TMS"],
+                "IS_LATEST_TXN": updates_snowpark_df["IS_LATEST_TXN"],
+                "MESH_LAST_UPDATE_TS": updates_snowpark_df["MESH_LAST_UPDATE_TS"],
+                "MESH_RUN_ID": updates_snowpark_df["MESH_RUN_ID"]
+            })]
+        )
+        print("Merge results for updates:")
+        print(update_merge_result)
+        
+    print("✅ Bitemporal merge process completed successfully.")
+    return "Success"
+
+
+def bi_temporal_merge_pandas(df_history: pd.DataFrame, df_delta: pd.DataFrame) -> pd.DataFrame:
+    """
+    Performs the core bitemporal logic. (This function is stable and correct).
+    """
+    extra_versions = []
+    data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    
+    df_delta = df_delta.sort_values("START_TMS")
+    closed_open_records = set()
+
+    def values_are_same(a, b):
+        if pd.isna(a) and pd.isna(b): return True
+        if pd.isna(a) or pd.isna(b): return False
+        return a == b
+
+    for _, d in df_delta.iterrows():
+        asset_id, start_tms, txn_start = d["ASSET_ID"], d["START_TMS"], d["LAST_CHG_TMS"]
+
+        hist_match = df_history[
+            (df_history["ASSET_ID"] == asset_id) & (df_history["START_TMS"] == start_tms)
+        ].sort_values("LAST_CHG_TMS")
+
+        if hist_match.empty:
+            open_hist = df_history[
+                (df_history["ASSET_ID"] == asset_id) & 
+                (df_history["END_TMS"].isna()) & (df_history["START_TMS"] < start_tms)
+            ].sort_values("LAST_CHG_TMS", ascending=False)
+            
+            if not open_hist.empty:
+                open_record = open_hist.iloc[0]
+                open_record_key = (asset_id, open_record["START_TMS"])
+                if open_record_key not in closed_open_records:
+                    new_txn_record = open_record.copy()
+                    new_txn_record["LAST_CHG_TMS"] = txn_start
+                    new_txn_record["END_TMS"] = start_tms - pd.to_timedelta(1, "s")
+                    extra_versions.append(new_txn_record)
+                    closed_open_records.add(open_record_key)
+            continue
+            
+        hist_row = hist_match.iloc[-1]
+        changed_cols = [c for c in data_cols if pd.notna(d[c]) and not values_are_same(d[c], hist_row[c])]
+        if not changed_cols: continue
+
+        future_rows = df_history[
+            (df_history["ASSET_ID"] == asset_id) & (df_history["START_TMS"] > hist_row["START_TMS"])
+        ].sort_values("START_TMS")
+
+        for _, f_row in future_rows.iterrows():
+            inherited_cols = [c for c in changed_cols if values_are_same(f_row[c], hist_row[c])]
+            if not inherited_cols: break
+            new_version = f_row.copy()
+            for c in inherited_cols: new_version[c] = d[c]
+            new_version["LAST_CHG_TMS"] = txn_start
+            extra_versions.append(new_version)
+
+    if extra_versions:
+        df_delta = pd.concat([df_delta, pd.DataFrame(extra_versions)], ignore_index=True, sort=False)
+
+    if "END_TMS" not in df_delta.columns: df_delta["END_TMS"] = pd.NaT
+    keys = list(zip(df_delta["ASSET_ID"], df_delta["START_TMS"]))
+    df_delta["END_TMS"] = [
+        df_delta.loc[i, "END_TMS"] if pd.notna(df_delta.loc[i, "END_TMS"]) else (
+            df_history[
+                (df_history["ASSET_ID"] == k[0]) & (df_history["START_TMS"] == k[1])
+            ]["END_TMS"].iloc[0] if not df_history[
+                (df_history["ASSET_ID"] == k[0]) & (df_history["START_TMS"] == k[1])
+            ].empty else pd.NaT
+        ) for i, k in enumerate(keys)
+    ]
+
+    keep_cols = ["ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS", "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS", "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS", "MESH_RUN_ID"]
+    df_unified = pd.concat([df_history[keep_cols], df_delta[keep_cols]], ignore_index=True)
+
+    sentinel_map = {"ASSET_PRICE": 1234567890.12345, "ASSET_MATURITY_TMS": pd.to_datetime("1700-01-01")}
+    group_cols = ["ASSET_ID"]
+    df_unified = df_unified.sort_values(by=group_cols + ["START_TMS", "LAST_CHG_TMS"])
+    fill_cols = [c for c in data_cols + ["DATA_PROVIDER_TYPE"] if c in df_unified.columns]
+    df_unified[fill_cols] = df_unified.groupby(group_cols, group_keys=False)[fill_cols].ffill()
+    for col, sentinel in sentinel_map.items():
+        if col in df_unified.columns:
+            mask = df_unified[col] == sentinel
+            df_unified.loc[mask, col] = pd.NaT if pd.api.types.is_datetime64_any_dtype(df_unified[col]) else pd.NA
+
+    state_cols = ["ASSET_ID", "START_TMS", "END_TMS", "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    df_unified = df_unified.sort_values(by=["ASSET_ID", "START_TMS", "LAST_CHG_TMS"])
+    df_clean = df_unified.drop_duplicates(subset=state_cols, keep="last")
+
+    df_clean["TXN_START_TMS"] = df_clean["LAST_CHG_TMS"]
+    df_clean["TXN_END_TMS"] = df_clean.groupby(["ASSET_ID", "START_TMS"])["TXN_START_TMS"].shift(-1) - pd.to_timedelta(1, "s")
+
+    df_clean['IS_LATEST_TXN_TEMP'] = df_clean["TXN_END_TMS"].isna()
+    df_clean = df_clean.sort_values(["ASSET_ID", "START_TMS"])
+    future_starts = df_clean.groupby(["ASSET_ID"])["START_TMS"].shift(-1)
+    needs_end = df_clean["END_TMS"].isna() & future_starts.notna() & df_clean['IS_LATEST_TXN_TEMP']
+    df_clean.loc[needs_end, "END_TMS"] = future_starts[needs_end] - pd.to_timedelta(1, "s")
+    df_clean = df_clean.drop(columns=['IS_LATEST_TXN_TEMP'])
+
+    vt_group_cols = ["ASSET_ID", "START_TMS"]
+    df_clean["IS_LATEST_TXN"] = df_clean["TXN_END_TMS"].isna()
+    df_clean = df_clean.sort_values(by=vt_group_cols + ["LAST_CHG_TMS"])
+    latest_end_tms_map = df_clean.groupby(vt_group_cols)["END_TMS"].transform('last')
+    df_clean["IS_CURRENT"] = latest_end_tms_map.isna()
+
+    final_cols = ["ASSET_ID", "DATA_PROVIDER", "DATA_PROVIDER_TYPE", "START_TMS", "END_TMS", "LAST_CHG_TMS", "TXN_START_TMS", "TXN_END_TMS", "IS_CURRENT", "IS_LATEST_TXN", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS", "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS", "MESH_RUN_ID"]
+    final_df = df_clean[final_cols].reset_index(drop=True)
+    
+    return final_df
