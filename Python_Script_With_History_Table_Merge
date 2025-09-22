@@ -142,8 +142,24 @@ def bi_temporal_merge_pandas(df_history: pd.DataFrame, df_delta: pd.DataFrame) -
     """
     Performs the core bitemporal logic. (This function is stable and correct).
     """
+    if not df_history.empty:
+        history_cols = df_history.columns.tolist()
+    else:
+        history_cols = df_delta.columns.tolist() + [
+            'END_TMS', 'TXN_START_TMS', 'TXN_END_TMS', 'IS_CURRENT', 'IS_LATEST_TXN', 
+            'MESH_INSRT_TS', 'MESH_LAST_UPDATE_TS', 'MESH_RUN_ID'
+        ]
+        # Ensure no duplicates in the constructed column list
+        history_cols = sorted(set(history_cols), key=history_cols.index)
+
+    non_data_cols = {
+        "ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS",
+        "TXN_START_TMS", "TXN_END_TMS", "IS_CURRENT", "IS_LATEST_TXN",
+        "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS", "MESH_RUN_ID"
+    }
+    data_cols = [c for c in history_cols if c not in non_data_cols]
     extra_versions = []
-    data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    #data_cols = ["ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
     
     df_delta = df_delta.sort_values("START_TMS")
     closed_open_records = set()
@@ -178,7 +194,11 @@ def bi_temporal_merge_pandas(df_history: pd.DataFrame, df_delta: pd.DataFrame) -
             continue
             
         hist_row = hist_match.iloc[-1]
-        changed_cols = [c for c in data_cols if pd.notna(d[c]) and not values_are_same(d[c], hist_row[c])]
+        print("hist row schema")
+        print(hist_row.info())
+        
+        #changed_cols = [c for c in data_cols if pd.notna(d[c]) and not values_are_same(d[c], hist_row[c])]
+        changed_cols = [c for c in data_cols if c in d and pd.notna(d[c]) and not values_are_same(d.get(c), hist_row.get(c))]        
         if not changed_cols: continue
 
         future_rows = df_history[
@@ -208,20 +228,24 @@ def bi_temporal_merge_pandas(df_history: pd.DataFrame, df_delta: pd.DataFrame) -
         ) for i, k in enumerate(keys)
     ]
 
-    keep_cols = ["ASSET_ID", "DATA_PROVIDER", "START_TMS", "END_TMS", "LAST_CHG_TMS", "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS", "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS", "MESH_RUN_ID"]
+    keep_exclude_cols = ["IS_CURRENT", "IS_CURRENT_TXN", "TXN_START_TMS", "TXN_END_TMS"]
+    keep_cols = [col for col in history_cols if col not in keep_exclude_cols]
     df_unified = pd.concat([df_history[keep_cols], df_delta[keep_cols]], ignore_index=True)
 
     sentinel_map = {"ASSET_PRICE": 1234567890.12345, "ASSET_MATURITY_TMS": pd.to_datetime("1700-01-01")}
     group_cols = ["ASSET_ID"]
     df_unified = df_unified.sort_values(by=group_cols + ["START_TMS", "LAST_CHG_TMS"])
-    fill_cols = [c for c in data_cols + ["DATA_PROVIDER_TYPE"] if c in df_unified.columns]
+    
+    fill_cols = [c for c in data_cols if c in df_unified.columns]
     df_unified[fill_cols] = df_unified.groupby(group_cols, group_keys=False)[fill_cols].ffill()
     for col, sentinel in sentinel_map.items():
         if col in df_unified.columns:
             mask = df_unified[col] == sentinel
             df_unified.loc[mask, col] = pd.NaT if pd.api.types.is_datetime64_any_dtype(df_unified[col]) else pd.NA
 
-    state_cols = ["ASSET_ID", "START_TMS", "END_TMS", "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    #state_cols = ["ASSET_ID", "START_TMS", "END_TMS", "DATA_PROVIDER_TYPE", "ASSET_COUNTRY", "ASSET_CURRENCY", "ASSET_PRICE", "ASSET_MATURITY_TMS"]
+    exclude_from_state = {"DATA_PROVIDER", "DATA_PROVIDER_TYPE", "TXN_START_TMS", "TXN_END_TMS", "IS_CURRENT", "IS_LATEST_TXN", "MESH_INSRT_TS", "MESH_LAST_UPDATE_TS", "MESH_RUN_ID"}
+    state_cols = [c for c in df_unified.columns if c not in exclude_from_state]
     df_unified = df_unified.sort_values(by=["ASSET_ID", "START_TMS", "LAST_CHG_TMS"])
     df_clean = df_unified.drop_duplicates(subset=state_cols, keep="last")
 
