@@ -1,12 +1,19 @@
--- Step 1: Find all unique partitions (keys) that have changed in the stream.
+-- This SELECT query computes the definitive, authoritative timeline
+-- for only the partitions (ASSET_ID, QLTY_RAT_SRCE_TYP) that have changed.
+-- The result should be used as the SOURCE in your Snowpark MERGE statement.
+
+-- 1. Identify all partitions (keys) touched by the stream's new appends.
 WITH DirtyKeys AS (
     SELECT DISTINCT 
         ASSET_ID, 
         QLTY_RAT_SRCE_TYP
     FROM ASSET_RATING_STREAM
+    -- METADATA$ACTION will always be 'INSERT' in an append-only stream, 
+    -- so this filter is often omitted but kept for conceptual clarity.
+    WHERE METADATA$ACTION = 'INSERT' 
 ),
 
--- Step 2: Get all *current* data from the base table for *only* those dirty keys.
+-- 2. Get all *current* history data from the base table for *only* those dirty keys.
 CurrentDataForDirtyKeys AS (
     SELECT r.*
     FROM ASSET_RATING AS r
@@ -15,32 +22,39 @@ CurrentDataForDirtyKeys AS (
       AND r.QLTY_RAT_SRCE_TYP = d.QLTY_RAT_SRCE_TYP
 ),
 
--- == New Timeline Calculation (The "SRC" of the MERGE) ==
--- (Logic remains correct for finding the new authoritative state)
-
+-- 3. Find the single most recent state (UP, PT, or DL) for each unique START_TMS.
 LatestStateAll AS (
     SELECT 
         ASSET_ID, QLTY_RAT_SRCE_TYP, RATING_VALUE,
         DATE_TRUNC('DAY', START_TMS) AS EFFECTIVE_START_DATE,
         END_TMS AS EXPLICIT_END_TMS,
         COALESCE(A_TIMSTAMP, LAST_CHG_TMS) AS LAST_CHG_TMS,
-        A_ENTTYP
+        A_ENTTYP -- Logical action type (PT, UP, DL)
     FROM CurrentDataForDirtyKeys
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP, START_TMS
-        ORDER BY COALESCE(A_TIMSTAMP, LAST_CHG_TMS) DESC
+        ORDER BY COALESCE(A_TIMSTAMP, LAST_CHG_TMS) DESC -- Order by source timestamp
     ) = 1
 ),
+
+-- 4. Filter out any records whose latest action was a logical DELETE ('DL').
 LatestValidState AS (
-    SELECT * FROM LatestStateAll WHERE A_ENTTYP != 'DL'
+    SELECT *
+    FROM LatestStateAll
+    WHERE A_ENTTYP != 'DL'
 ),
+
+-- 5. Calculate the correct timeline and determine implicit end dates.
 NewTimeline AS (
-    -- This is the NEW, CORRECT timeline for the dirty keys
     SELECT
         ASSET_ID, QLTY_RAT_SRCE_TYP, RATING_VALUE,
         EFFECTIVE_START_DATE,
+        -- Calculate the correct EFFECTIVE_END_DATE
         COALESCE(
+            -- Priority 1: Explicit end date (from an 'UP' action)
             DATE_TRUNC('DAY', EXPLICIT_END_TMS), 
+            
+            -- Priority 2: Day before the next rating starts (implicit end)
             DATEADD(DAY, -1, LEAD(EFFECTIVE_START_DATE) OVER (
                 PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP
                 ORDER BY EFFECTIVE_START_DATE
@@ -48,63 +62,27 @@ NewTimeline AS (
         ) AS EFFECTIVE_END_DATE,
         LAST_CHG_TMS
     FROM LatestValidState
-),
-
--- == Old Timeline Simulation (To identify rows to "delete") ==
-OldTimeline AS (
-    SELECT
-        TGT.ASSET_ID,
-        TGT.QLTY_RAT_SRCE_TYP,
-        TGT.EFFECTIVE_START_DATE
-    FROM VALID_RATINGS AS TGT -- <<< Target Table Access
-    JOIN DirtyKeys AS d 
-      ON TGT.ASSET_ID = d.ASSET_ID 
-      AND TGT.QLTY_RAT_SRCE_TYP = d.QLTY_RAT_SRCE_TYP
-),
-
--- == Combine the two sets to produce the final, merged output ==
-FinalDeltaOutput AS (
-    -- 1. Output the NEW timeline records (The "Inserts" and "Updates")
-    SELECT
-        ASSET_ID,
-        QLTY_RAT_SRCE_TYP,
-        RATING_VALUE,
-        EFFECTIVE_START_DATE,
-        EFFECTIVE_END_DATE,
-        LAST_CHG_TMS
-    FROM NewTimeline
-
-    UNION ALL
-
-    -- 2. Output the records that were in the OLD timeline but are NOT in the NEW one.
-    -- We only generate a sentinel if the key (ASSET/SOURCE/START_DATE) is missing
-    -- from the NewTimeline, signifying a true logical deletion.
-    SELECT
-        OLD.ASSET_ID,
-        OLD.QLTY_RAT_SRCE_TYP,
-        '$$DELETED$$' AS RATING_VALUE, -- Sentinel for deletion
-        OLD.EFFECTIVE_START_DATE,
-        NULL AS EFFECTIVE_END_DATE,     
-        NULL AS LAST_CHG_TMS
-    FROM OldTimeline AS OLD
-    LEFT JOIN NewTimeline AS NEW
-        ON OLD.ASSET_ID = NEW.ASSET_ID
-        AND OLD.QLTY_RAT_SRCE_TYP = NEW.QLTY_RAT_SRCE_TYP
-        AND OLD.EFFECTIVE_START_DATE = NEW.EFFECTIVE_START_DATE
-    WHERE NEW.EFFECTIVE_START_DATE IS NULL -- **CORRECTED FILTER: Only generate sentinel if key is absent**
 )
 
--- This final SELECT provides the complete set of instructions for the MERGE.
-SELECT *
-FROM FinalDeltaOutput
-ORDER BY ASSET_ID, QLTY_RAT_SRCE_TYP, EFFECTIVE_START_DATE;
+-- Final SELECT: The authoritative Source of Truth for the changed partitions.
+SELECT 
+    ASSET_ID,
+    QLTY_RAT_SRCE_TYP,
+    RATING_VALUE,
+    EFFECTIVE_START_DATE,
+    EFFECTIVE_END_DATE,
+    LAST_CHG_TMS
+FROM NewTimeline
+ORDER BY 
+    ASSET_ID, 
+    QLTY_RAT_SRCE_TYP, 
+    EFFECTIVE_START_DATE;
 
 
 
 
 
-
-
+--OLD QUERY -----------------------------------------------------------------------------
 -- Step 1: Find all unique partitions (keys) that have changed in the stream.
 WITH DirtyKeys AS (
     SELECT DISTINCT 
