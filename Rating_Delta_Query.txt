@@ -7,6 +7,113 @@ WITH DirtyKeys AS (
 ),
 
 -- Step 2: Get all *current* data from the base table for *only* those dirty keys.
+CurrentDataForDirtyKeys AS (
+    SELECT r.*
+    FROM ASSET_RATING AS r
+    JOIN DirtyKeys AS d 
+      ON r.ASSET_ID = d.ASSET_ID 
+      AND r.QLTY_RAT_SRCE_TYP = d.QLTY_RAT_SRCE_TYP
+),
+
+-- == New Timeline Calculation (The "SRC" of the MERGE) ==
+-- (Logic remains correct for finding the new authoritative state)
+
+LatestStateAll AS (
+    SELECT 
+        ASSET_ID, QLTY_RAT_SRCE_TYP, RATING_VALUE,
+        DATE_TRUNC('DAY', START_TMS) AS EFFECTIVE_START_DATE,
+        END_TMS AS EXPLICIT_END_TMS,
+        COALESCE(A_TIMSTAMP, LAST_CHG_TMS) AS LAST_CHG_TMS,
+        A_ENTTYP
+    FROM CurrentDataForDirtyKeys
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP, START_TMS
+        ORDER BY COALESCE(A_TIMSTAMP, LAST_CHG_TMS) DESC
+    ) = 1
+),
+LatestValidState AS (
+    SELECT * FROM LatestStateAll WHERE A_ENTTYP != 'DL'
+),
+NewTimeline AS (
+    -- This is the NEW, CORRECT timeline for the dirty keys
+    SELECT
+        ASSET_ID, QLTY_RAT_SRCE_TYP, RATING_VALUE,
+        EFFECTIVE_START_DATE,
+        COALESCE(
+            DATE_TRUNC('DAY', EXPLICIT_END_TMS), 
+            DATEADD(DAY, -1, LEAD(EFFECTIVE_START_DATE) OVER (
+                PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP
+                ORDER BY EFFECTIVE_START_DATE
+            ))
+        ) AS EFFECTIVE_END_DATE,
+        LAST_CHG_TMS
+    FROM LatestValidState
+),
+
+-- == Old Timeline Simulation (To identify rows to "delete") ==
+OldTimeline AS (
+    SELECT
+        TGT.ASSET_ID,
+        TGT.QLTY_RAT_SRCE_TYP,
+        TGT.EFFECTIVE_START_DATE
+    FROM VALID_RATINGS AS TGT -- <<< Target Table Access
+    JOIN DirtyKeys AS d 
+      ON TGT.ASSET_ID = d.ASSET_ID 
+      AND TGT.QLTY_RAT_SRCE_TYP = d.QLTY_RAT_SRCE_TYP
+),
+
+-- == Combine the two sets to produce the final, merged output ==
+FinalDeltaOutput AS (
+    -- 1. Output the NEW timeline records (The "Inserts" and "Updates")
+    SELECT
+        ASSET_ID,
+        QLTY_RAT_SRCE_TYP,
+        RATING_VALUE,
+        EFFECTIVE_START_DATE,
+        EFFECTIVE_END_DATE,
+        LAST_CHG_TMS
+    FROM NewTimeline
+
+    UNION ALL
+
+    -- 2. Output the records that were in the OLD timeline but are NOT in the NEW one.
+    -- We only generate a sentinel if the key (ASSET/SOURCE/START_DATE) is missing
+    -- from the NewTimeline, signifying a true logical deletion.
+    SELECT
+        OLD.ASSET_ID,
+        OLD.QLTY_RAT_SRCE_TYP,
+        '$$DELETED$$' AS RATING_VALUE, -- Sentinel for deletion
+        OLD.EFFECTIVE_START_DATE,
+        NULL AS EFFECTIVE_END_DATE,     
+        NULL AS LAST_CHG_TMS
+    FROM OldTimeline AS OLD
+    LEFT JOIN NewTimeline AS NEW
+        ON OLD.ASSET_ID = NEW.ASSET_ID
+        AND OLD.QLTY_RAT_SRCE_TYP = NEW.QLTY_RAT_SRCE_TYP
+        AND OLD.EFFECTIVE_START_DATE = NEW.EFFECTIVE_START_DATE
+    WHERE NEW.EFFECTIVE_START_DATE IS NULL -- **CORRECTED FILTER: Only generate sentinel if key is absent**
+)
+
+-- This final SELECT provides the complete set of instructions for the MERGE.
+SELECT *
+FROM FinalDeltaOutput
+ORDER BY ASSET_ID, QLTY_RAT_SRCE_TYP, EFFECTIVE_START_DATE;
+
+
+
+
+
+
+
+-- Step 1: Find all unique partitions (keys) that have changed in the stream.
+WITH DirtyKeys AS (
+    SELECT DISTINCT 
+        ASSET_ID, 
+        QLTY_RAT_SRCE_TYP
+    FROM ASSET_RATING_STREAM
+),
+
+-- Step 2: Get all *current* data from the base table for *only* those dirty keys.
 -- This is crucial for handling back-dating, as the stream alone doesn't have enough context.
 CurrentDataForDirtyKeys AS (
     SELECT r.*
