@@ -1,0 +1,88 @@
+-- Step 1: Find all unique partitions (keys) that have changed in the stream.
+WITH DirtyKeys AS (
+    SELECT DISTINCT 
+        ASSET_ID, 
+        QLTY_RAT_SRCE_TYP
+    FROM ASSET_RATING_STREAM
+),
+
+-- Step 2: Get all *current* data from the base table for *only* those dirty keys.
+-- This is crucial for handling back-dating, as the stream alone doesn't have enough context.
+CurrentDataForDirtyKeys AS (
+    SELECT r.*
+    FROM ASSET_RATING AS r
+    JOIN DirtyKeys AS d 
+      ON r.ASSET_ID = d.ASSET_ID 
+      AND r.QLTY_RAT_SRCE_TYP = d.QLTY_RAT_SRCE_TYP
+),
+
+-- == The next 3 CTEs are your proven full-load logic, ==
+-- == applied *only* to the subset of data that changed. ==
+
+-- Step 3: Find the absolute latest state for each logical record (by start time),
+-- including 'DL' records, so we can correctly filter them.
+LatestStateAll AS (
+    SELECT 
+        ASSET_ID,
+        QLTY_RAT_SRCE_TYP,
+        RATING_VALUE,
+        DATE_TRUNC('DAY', START_TMS) AS EFFECTIVE_START_DATE,
+        END_TMS AS EXPLICIT_END_TMS,
+        COALESCE(A_TIMSTAMP, LAST_CHG_TMS) AS LAST_CHG_TMS,
+        A_ENTTYP
+    FROM CurrentDataForDirtyKeys
+    -- Find the single most recent record for each logical key
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP, START_TMS
+        ORDER BY COALESCE(A_TIMSTAMP, LAST_CHG_TMS) DESC
+    ) = 1
+),
+
+-- Step 4: Filter out any logical record whose *true latest state* was a 'DL' (Delete).
+LatestValidState AS (
+    SELECT *
+    FROM LatestStateAll
+    WHERE A_ENTTYP != 'DL'
+),
+
+-- Step 5: Calculate the correct end dates for the remaining valid records
+-- by looking at the next record's start date (implicit ending).
+CalculatedEndDates AS (
+    SELECT
+        ASSET_ID,
+        QLTY_RAT_SRCE_TYP,
+        RATING_VALUE,
+        EFFECTIVE_START_DATE,
+        EXPLICIT_END_TMS,
+        LAST_CHG_TMS,
+        -- Find the next start date for this asset/source partition
+        LEAD(EFFECTIVE_START_DATE) OVER (
+            PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP
+            ORDER BY EFFECTIVE_START_DATE
+        ) AS NEXT_START_DATE
+    FROM LatestValidState
+)
+
+-- Step 6: Build the final timeline for *only the changed assets*.
+-- This is the result set you will use as the "SOURCE" in your Snowpark MERGE.
+SELECT 
+    ASSET_ID,
+    QLTY_RAT_SRCE_TYP,
+    RATING_VALUE,
+    EFFECTIVE_START_DATE,
+    -- Determine the correct end date
+    COALESCE(
+        -- Priority 1: Use the explicit end date if it exists (from an 'UP' record)
+        DATE_TRUNC('DAY', EXPLICIT_END_TMS), 
+        
+        -- Priority 2: Use the day before the next rating starts
+        DATEADD(DAY, -1, NEXT_START_DATE)
+        
+        -- Priority 3: If neither exists, it's an open-ended record (NULL)
+    ) AS EFFECTIVE_END_DATE,
+    LAST_CHG_TMS
+FROM CalculatedEndDates
+ORDER BY 
+    ASSET_ID, 
+    QLTY_RAT_SRCE_TYP, 
+    EFFECTIVE_START_DATE;
