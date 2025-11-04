@@ -1,0 +1,69 @@
+WITH LatestStateAll AS (
+    -- Step 1: Find the *absolute latest* state for each logical record (by start time),
+    -- including 'DL' records.
+    SELECT 
+        ASSET_ID,
+        QLTY_RAT_SRCE_TYP,
+        RATING_VALUE,
+        -- Truncate START_TMS to the beginning of the day as requested
+        DATE_TRUNC('DAY', START_TMS) AS EFFECTIVE_START_DATE,
+        END_TMS AS EXPLICIT_END_TMS,
+        COALESCE(A_TIMSTAMP, LAST_CHG_TMS) AS LAST_CHG_TMS,
+        A_ENTTYP -- <-- We must select this to filter on it next
+    FROM ASSET_RATING
+    -- Use QUALIFY to find the single most recent record for each 
+    -- logical key (ASSET_ID, QLTY_RAT_SRCE_TYP, START_TMS)
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP, START_TMS
+        ORDER BY COALESCE(A_TIMSTAMP, LAST_CHG_TMS) DESC
+    ) = 1
+),
+
+LatestValidState AS (
+    -- Step 2: Now that we have the *true* latest state, filter out
+    -- any logical record whose latest state was 'DL' (Delete).
+    SELECT *
+    FROM LatestStateAll
+    WHERE A_ENTTYP != 'DL' -- <-- This filter is now in the correct place
+),
+
+CalculatedEndDates AS (
+    -- Step 3: For the remaining valid records, find the start date 
+    -- of the *next* record to calculate the implicit end date.
+    SELECT
+        ASSET_ID,
+        QLTY_RAT_SRCE_TYP,
+        RATING_VALUE,
+        EFFECTIVE_START_DATE,
+        EXPLICIT_END_TMS,
+        LAST_CHG_TMS, -- Pass the determined LAST_CHG_TMS through
+        -- Find the next start date for this asset/source partition
+        LEAD(EFFECTIVE_START_DATE) OVER (
+            PARTITION BY ASSET_ID, QLTY_RAT_SRCE_TYP
+            ORDER BY EFFECTIVE_START_DATE
+        ) AS NEXT_START_DATE
+    FROM LatestValidState
+)
+
+-- Step 4: Build the final timeline
+SELECT 
+    ASSET_ID,
+    QLTY_RAT_SRCE_TYP,
+    RATING_VALUE,
+    EFFECTIVE_START_DATE,
+    -- Determine the correct end date
+    COALESCE(
+        -- Priority 1: Use the explicit end date if it exists (from an 'UP' record)
+        DATE_TRUNC('DAY', EXPLICIT_END_TMS), 
+        
+        -- Priority 2: Use the day before the next rating starts
+        DATEADD(DAY, -1, NEXT_START_DATE)
+        
+        -- Priority 3: If neither exists, it's an open-ended record (NULL)
+    ) AS EFFECTIVE_END_DATE,
+    LAST_CHG_TMS
+FROM CalculatedEndDates
+ORDER BY 
+    ASSET_ID, 
+    QLTY_RAT_SRCE_TYP, 
+    EFFECTIVE_START_DATE;
