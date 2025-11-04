@@ -1,0 +1,67 @@
+Ratings
+==================
+Snowflake table ASSET_RATING
+Columns
+ASSET_ID StringType(10)
+QLTY_RAT_SRCE_TYP StringType(8)
+START_TMS (Timestamp NTZ)
+END_TMS (Timestamp NTZ)
+LAST_CHG_TMS (Timestamp NTZ)	-> Indicates the time used by the module which updated the DB2 table
+RATING_VALUE (StringType)	-> Could be like A, A+, B-, MULTI etc
+A_ENTTYP StringType(2)
+A_TIMSTAMP (Timestamp NTZ)	-> Indicates the time when the change happened in source DB2 table
+
+A_ENTTYP - PT means INSERT
+A_ENTTYP - DL means DELETE
+A_ENTTYP - UP means UPDATE
+
+QLTY_RAT_SRCE_TYP - Contains the source of the rating value. Could be MOODY, FITCH or S&P
+
+
+START_TMS is always at the beginning of the day like 2025-01-01 00:00:00.000000 (some rare cases it might be not but when we select we need to truncate it to the day)
+END_TMS is always the end of the day like 2025-01-10 23:59:59.999999
+
+START_TMS and END_TMS is at the ASSET_ID and QLTY_RAT_SRCE_TYP level
+
+For each ASSET_ID and QLTY_RAT_SRCE_TYP combination, we can have multiple records in the table with different time windows (START_TMS/END_TMS) since the asset rating can be updated by the Rating agencies
+This table is populated in an append only mode based on updates happening in a source DB2 table. Hence if a record was inserted and later ended or deleted, it will have both the INSERT (PT) and UPDATE (UP) to end or the DELETE (DL) to delete the record.
+
+The ASSET_RATING table will never have overlapping ratings. In rare cases, a new rating might be inserted with a later START_TMS than the existing record without ending the existing record. In that case, we can use this future record START_TMS to calculate the END_TMS of the earlier open record.
+
+We can have uses when a record for an ASSET_ID and QLTY_RAT_SRCE_TYP (say FITCH) is inserted with RATING_VALUE = A, START_TMS = 2025-11-01 and NULL END_TMS on LAST_CHG_TMS/A_TIMSTAMP 2025-11-01. Later on 2025-11-03, this record can be deleted and another record can be inserted for RATING_VALUE = A+, START_TMS = 2025-10-01 and NULL END_TMS on LAST_CHG_TMS/A_TIMSTAMP 2025-11-03. It effectively means that FITCH has assigned a back-dated rating of A+ on 2025-11-03.
+
+We need to come up with a select query which reads all the in-scope records from this ASSET_RATING and determines the valid rating for each time period. If the above scenario happens, then we can ignore the FITCH record with START_TMS = 2025-11-01 that was inserted and deleted later.
+
+I want to ignore any rating record that was inserted and later deleted
+
+We need to output LAST_CHG_TMS column too. This will contain the value of A_TIMSTAMP if it is not NULL else it will contain the value of LAST_CHG_TMS column.
+
+Can you first come with the query to create a table with sample data based on all what I have described above. Then, you can come up with a SELECT query which will return the valid rating for each time period as explained above.
+
+
+Rating Delta 
+===============
+The SELECT query we generated now is good for reqading the current state of ASSET_RATING table and loading into a target table.
+
+Next, we need to create a stream on the ASSET_RATING table to capture future changes in this table and apply it to the target table.
+
+Then, whenever we recieve INSERT or UPDATE or DELETE in the stream, we need to perform the following.
+1) For INSERTs, we can simply select the rating value from the stream INSERT record. This is fine for both the below scenarios
+	a) INSERT for an asset and source which doesn't have any existing rows
+	b) UPDATE to end the existing record and insert a new record like the scenario 1 in our sample
+	c) INSERT with a future row when there is already an existing open row like in scenario 3 of our sample
+2) For UPDATEs to end the record without any follow up INSERTs, select query needs to output a SENTINEL like $$DELETED$$
+3) For in-place updates to open (NULL END_TMS) records, query needs to output the latest rating value in the stream
+4) For DELETEs without any follow up INSERTs, select query needs to output a SENTINEL like $$DELETED$$
+5) For DELETEs with follow up INSERTs having START_TMS > DELETED records START_TMS, then output 2 records
+	a) first record with SENTINEL with the DELETED record's START_TMS
+	b) second record with the INSERT records rating with its corresponding START_TMS
+5) For DELETEs with follow up INSERTs having START_TMS < DELETED records START_TMS (like in scenario 2 of our sample), then output 2 records
+	a) first record with RATING value from the INSERTed record and its START_TMS
+	b) second record with the INSERT records rating with the DELETED record's START_TMS. This means even for the that future date when the delete happened, this past dated rating INSERT is the value now.
+
+To handle some of these scenarios, we cannot rely just on the stream and we might have to go back to the ASSET_RATING table itself.
+
+Like the earlier full load select query, we need to output LAST_CHG_TMS column too. This will contain the value of A_TIMSTAMP if it is not NULL else it will contain the value of LAST_CHG_TMS column.
+
+Do these requirements make sense to you. If yes, please write a select query to accomplish this along with the CREATE STREAM and some sample INSERT, UPDATE, DELETEs to test it.
